@@ -24,7 +24,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-
 use crate::bpf::bindings::*;
 
 fn show_profile(
@@ -331,13 +330,11 @@ impl Profiler<'_> {
 
         thread::spawn(move || loop {
             match profile_receive.lock().unwrap().recv() {
-                Ok(profile) => {
-                    show_profile(
-                        profile,
-                        &procs.lock().unwrap(),
-                        &object_files.lock().unwrap(),
-                    )
-                },
+                Ok(profile) => show_profile(
+                    profile,
+                    &procs.lock().unwrap(),
+                    &object_files.lock().unwrap(),
+                ),
                 Err(e) => {
                     println!("failed to receive event {:?}", e);
                 }
