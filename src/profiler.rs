@@ -27,7 +27,7 @@ use std::time::Instant;
 use crate::bpf::bindings::*;
 
 fn show_profile(
-    profile: RawProfile,
+    profile: &RawProfile,
     procs: &HashMap<i32, ProcessInfo>,
     objs: &HashMap<String, ObjectFileInfo>,
 ) {
@@ -118,6 +118,7 @@ enum MappingType {
     Vdso,
 }
 
+#[derive(Clone)]
 struct ProcessInfo {
     mappings: Vec<ExecutableMapping>,
 }
@@ -222,6 +223,8 @@ pub struct Profiler<'bpf> {
     chan_send: Arc<Mutex<mpsc::Sender<Event>>>,
     chan_receive: Arc<Mutex<mpsc::Receiver<Event>>>,
     // Native unwinding state
+    dirty: bool,
+    last_persisted: Instant,
     live_shard: Arc<Mutex<Vec<stack_unwind_row_t>>>,
     build_id_to_executable_id: Arc<Mutex<HashMap<String, u32>>>,
     shard_index: Arc<AtomicU64>,
@@ -232,6 +235,60 @@ pub struct Profiler<'bpf> {
     // Profile channel
     profile_send: Arc<Mutex<mpsc::Sender<RawProfile>>>,
     profile_receive: Arc<Mutex<mpsc::Receiver<RawProfile>>>,
+}
+
+pub struct Collector {
+    profiles: Vec<RawProfile>,
+    procs: HashMap<i32, ProcessInfo>,
+    objs: HashMap<String, ObjectFileInfo>,
+}
+
+type ThreadSafeCollector = Arc<Mutex<Collector>>;
+
+impl Collector {
+    pub fn new() -> ThreadSafeCollector {
+        Arc::new(Mutex::new(Self {
+            profiles: Vec::new(),
+            procs: HashMap::new(),
+            objs: HashMap::new(),
+        }))
+    }
+
+    pub fn collect(
+        &mut self,
+        profile: RawProfile,
+        procs: &HashMap<i32, ProcessInfo>,
+        objs: &HashMap<String, ObjectFileInfo>,
+    ) {
+        self.profiles.push(profile.clone());
+
+        for (k, v) in procs {
+            self.procs.insert(*k, v.clone());
+        }
+
+        for (k, v) in objs {
+            self.objs.insert(
+                k.clone(),
+                ObjectFileInfo {
+                    file: std::fs::File::open(v.path.clone()).unwrap(),
+                    path: v.path.clone(),
+                    elf_load: v.elf_load,
+                    is_dyn: v.is_dyn,
+                    main_bin: v.main_bin,
+                },
+            );
+        }
+    }
+
+    pub fn finish(&self) {
+        println!("Collector::finish {}", self.profiles.len());
+
+        for profile in &self.profiles {
+            show_profile(profile, &self.procs, &self.objs);
+        }
+
+        thread::sleep(Duration::from_secs(5));
+    }
 }
 
 // Static config
@@ -281,6 +338,8 @@ impl Profiler<'_> {
             object_files,
             chan_send,
             chan_receive,
+            dirty: false,
+            last_persisted: Instant::now() - Duration::from_secs(1_000), // old enough to trigger it the first time
             live_shard,
             build_id_to_executable_id,
             shard_index,
@@ -306,7 +365,7 @@ impl Profiler<'_> {
             .expect("handle send");
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self, duration: Duration, collector: Arc<Mutex<Collector>>) {
         self.setup_perf_events();
         self.set_bpf_map_info();
 
@@ -327,16 +386,19 @@ impl Profiler<'_> {
         let profile_receive = self.profile_receive.clone();
         let procs = self.procs.clone();
         let object_files = self.object_files.clone();
+        let collector = collector.clone();
 
         thread::spawn(move || loop {
             match profile_receive.lock().unwrap().recv() {
-                Ok(profile) => show_profile(
-                    profile,
-                    &procs.lock().unwrap(),
-                    &object_files.lock().unwrap(),
-                ),
-                Err(e) => {
-                    println!("failed to receive event {:?}", e);
+                Ok(profile) => {
+                    collector.lock().unwrap().collect(
+                        profile,
+                        &procs.lock().unwrap(),
+                        &object_files.lock().unwrap(),
+                    );
+                }
+                Err(_e) => {
+                    // println!("failed to receive event {:?}", e);
                 }
             }
         });
@@ -344,6 +406,14 @@ impl Profiler<'_> {
         let mut start = Instant::now();
 
         loop {
+            println!("main loop {:?}", start.elapsed());
+            if start.elapsed() >= duration {
+                println!("done after running for {:?}", start.elapsed());
+                let profile = self.collect_profile();
+                self.send_profile(profile);
+                break;
+            }
+
             println!("== elapsed {:?}", start.elapsed());
             if start.elapsed() >= Duration::from_secs(5) {
                 let profile = self.collect_profile();
@@ -351,13 +421,25 @@ impl Profiler<'_> {
                 start = Instant::now();
             }
 
+            let s = Instant::now();
             let read = self.chan_receive.lock().expect("receive lock").try_recv();
+            println!("event_new_proc lock took {:?}", s.elapsed());
+
             match read {
                 Ok(event) => {
                     let pid = event.pid;
 
                     if event.type_ == event_type_EVENT_NEW_PROCESS {
+                        let s = Instant::now();
                         self.event_new_proc(pid);
+                        let mut pname = "<unknown>".to_string();
+                        if let Ok(proc) = procfs::process::Process::new(pid) {
+                            if let Ok(name) = proc.cmdline() {
+                                pname = name.join("").to_string();
+                            }
+                        }
+
+                        println!("event_new_proc took {:?} for {}", s.elapsed(), pname);
                     } else {
                         println!("unknow event {}", event.type_);
                     }
@@ -365,6 +447,14 @@ impl Profiler<'_> {
                 Err(_) => {
                     // todo
                 }
+            }
+
+            if self.dirty && self.last_persisted.elapsed() > Duration::from_millis(100) {
+                let my_live_shard = self.live_shard.try_lock().unwrap();
+
+                self.persist_unwind_info(&my_live_shard);
+                self.dirty = false;
+                self.last_persisted = Instant::now();
             }
         }
     }
@@ -438,6 +528,28 @@ impl Profiler<'_> {
         self.procs.lock().expect("lock").get(&pid).is_some()
     }
 
+    fn persist_unwind_info(&self, live_shard: &Vec<stack_unwind_row_t>) {
+        println!("calling persist!");
+        let start = Instant::now();
+
+        let key = &self.shard_index.load(Ordering::SeqCst).to_ne_bytes();
+        let val = unsafe {
+            // Probs we need to zero this mem?
+            std::slice::from_raw_parts(
+                live_shard.as_ptr() as *const u8,
+                live_shard.capacity() * ::std::mem::size_of::<stack_unwind_row_t>(),
+            )
+        };
+
+        self.bpf
+            .maps()
+            .unwind_tables()
+            .update(key, val, MapFlags::ANY)
+            .expect("update"); // error with  value: System(7)', src/main.rs:663:26
+
+        println!("persist_unwind_info took {:?}", start.elapsed());
+    }
+
     fn add_unwind_info(&mut self, pid: i32) {
         if !self.process_is_known(pid) {
             panic!("add_unwind_info -- expected process to be known");
@@ -446,7 +558,8 @@ impl Profiler<'_> {
         // Local unwind info state
         let mut dwarf_mappings = Vec::with_capacity(MAX_MAPPINGS_PER_PROCESS as usize);
         let mut num_mappings: u32 = 0;
-        let mut my_live_shard = self.live_shard.lock().unwrap();
+        let mut my_live_shard: std::sync::MutexGuard<'_, Vec<stack_unwind_row_t>> =
+            self.live_shard.lock().unwrap();
 
         // hack for kworkers and such
         let mut got_some_unwind_info: bool = true;
@@ -622,26 +735,9 @@ impl Profiler<'_> {
                     println!("!!!! [not fully implemented] no space in live shard");
                     self.low_index.store(0_u64, Ordering::SeqCst);
                     self.high_index.store(0_u64, Ordering::SeqCst);
-                    // - persist
-                    {
-                        self.bpf
-                            .maps()
-                            .unwind_tables()
-                            .update(
-                                &self.shard_index.load(Ordering::SeqCst).to_ne_bytes(),
-                                unsafe {
-                                    // Probs we need to zero this mem?
-                                    std::slice::from_raw_parts(
-                                        my_live_shard.as_ptr() as *const u8,
-                                        my_live_shard.capacity()
-                                            * ::std::mem::size_of::<stack_unwind_row_t>(),
-                                    )
-                                },
-                                MapFlags::ANY,
-                            )
-                            .expect("update");
-                    }
-                    // - clear / reset
+
+                    self.persist_unwind_info(&my_live_shard);
+
                     my_live_shard.truncate(0); // Vec::with_capacity(250_000);
                                                // - create shard (check if over limit)
                     self.shard_index.clone().fetch_add(1, Ordering::SeqCst);
@@ -662,30 +758,10 @@ impl Profiler<'_> {
                     println!("[dwarf-debug] we need a new shard, could not find marker!");
                     self.low_index.clone().store(0_u64, Ordering::SeqCst);
                     self.high_index.clone().store(0_u64, Ordering::SeqCst);
+                    self.dirty = true;
 
-                    // - persist
-                    {
-                        self.bpf
-                            .maps()
-                            .unwind_tables()
-                            .update(
-                                &self
-                                    .shard_index
-                                    .clone()
-                                    .load(Ordering::SeqCst)
-                                    .to_ne_bytes(),
-                                unsafe {
-                                    // Probs we need to zero this mem?
-                                    std::slice::from_raw_parts(
-                                        my_live_shard.as_ptr() as *const u8,
-                                        my_live_shard.capacity()
-                                            * ::std::mem::size_of::<stack_unwind_row_t>(),
-                                    )
-                                },
-                                MapFlags::ANY,
-                            )
-                            .expect("update");
-                    }
+                    self.persist_unwind_info(&my_live_shard);
+
                     // - clear / reset
                     my_live_shard.truncate(0); //= Vec::with_capacity(250_000);
                                                // - create shard (check if over limit)
@@ -701,7 +777,7 @@ impl Profiler<'_> {
                     rest_chunk.len()
                 );
 
-                if current_chunk[0].cfa_type == CfaType::EndFdeMarker as u8 {
+                /*                 if current_chunk[0].cfa_type == CfaType::EndFdeMarker as u8 {
                     panic!("wrong start of unwind info {:?}", current_chunk[0].cfa_type);
                 }
                 if current_chunk[current_chunk.len() - 1].cfa_type != CfaType::EndFdeMarker as u8 {
@@ -709,26 +785,26 @@ impl Profiler<'_> {
                         "wrong end of unwind info {:?}",
                         current_chunk[current_chunk.len() - 1].cfa_type
                     );
-                }
+                } */
 
-                let prev_index = my_live_shard.len();
+                let _prev_index = my_live_shard.len();
                 self.low_index
                     .store(my_live_shard.len() as u64, Ordering::SeqCst);
 
                 // Copy unwind info to the live shard
                 my_live_shard.append(&mut current_chunk.to_vec());
-
+                /*
                 if my_live_shard[prev_index].cfa_type == CfaType::EndFdeMarker as u8 {
                     panic!("wrong start of unwind info");
-                }
+                } */
                 self.high_index
                     .clone()
                     .store((my_live_shard.len() - 1) as u64, Ordering::SeqCst);
 
-                if my_live_shard[my_live_shard.len() - 1].cfa_type != CfaType::EndFdeMarker as u8 {
-                    panic!("wrong end of my_live_shard");
-                }
-
+                /*                 if my_live_shard[my_live_shard.len() - 1].cfa_type != CfaType::EndFdeMarker as u8 {
+                                   panic!("wrong end of my_live_shard");
+                               }
+                */
                 // == Add chunks
                 // Right now we only fnhave one
                 chunks.push(chunk_info_t {
@@ -778,26 +854,7 @@ impl Profiler<'_> {
         } // Added all mappings
 
         if got_some_unwind_info {
-            // == Persist live shard (this could be CPU intensive)
-            self.bpf
-                .maps()
-                .unwind_tables()
-                .update(
-                    &self
-                        .shard_index
-                        .clone()
-                        .load(Ordering::SeqCst)
-                        .to_ne_bytes(),
-                    unsafe {
-                        // Probs we need to zero this mem?
-                        std::slice::from_raw_parts(
-                            my_live_shard.as_ptr() as *const u8,
-                            my_live_shard.capacity() * ::std::mem::size_of::<stack_unwind_row_t>(),
-                        )
-                    },
-                    MapFlags::ANY,
-                )
-                .expect("update"); // error with  value: System(7)', src/main.rs:663:26
+            self.dirty = true;
 
             // == Add process info
             // "default"

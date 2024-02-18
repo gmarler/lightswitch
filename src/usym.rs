@@ -7,6 +7,8 @@ const ADDR2LINE_BIN: &str = "/usr/bin/addr2line";
 // in the future this should be done in the backend
 
 pub fn symbolize_native_stack(frames: Vec<u64>, object_path: &PathBuf) -> Vec<String> {
+    // return vec!["heh".to_string()];
+
     let mut cmd = Command::new(ADDR2LINE_BIN);
 
     cmd.arg("-f").arg("-e").arg(object_path);
