@@ -282,6 +282,16 @@ fn in_memory_unwind_info(path: &str) -> anyhow::Result<Vec<stack_unwind_row_t>> 
     Ok(unwind_info)
 }
 
+pub struct NativeUnwindState {
+    dirty: bool,
+    last_persisted: Instant,
+    live_shard: Vec<stack_unwind_row_t>,
+    build_id_to_executable_id: HashMap<String, u32>,
+    shard_index: u64,
+    low_index: u64,
+    high_index: u64,
+}
+
 pub struct Profiler<'bpf> {
     // Prevent the links from being removed
     _links: Vec<Link>,
@@ -289,17 +299,11 @@ pub struct Profiler<'bpf> {
     // Profiler state
     procs: Arc<Mutex<HashMap<i32, ProcessInfo>>>,
     object_files: Arc<Mutex<HashMap<String, ObjectFileInfo>>>,
-    // Channel for bpf events
+    // Channel for bpf events,.
     chan_send: Arc<Mutex<mpsc::Sender<Event>>>,
     chan_receive: Arc<Mutex<mpsc::Receiver<Event>>>,
     // Native unwinding state
-    dirty: bool,
-    last_persisted: Instant,
-    live_shard: Arc<Mutex<Vec<stack_unwind_row_t>>>,
-    build_id_to_executable_id: Arc<Mutex<HashMap<String, u32>>>,
-    shard_index: Arc<AtomicU64>,
-    low_index: Arc<AtomicU64>,
-    high_index: Arc<AtomicU64>,
+    native_unwind_state: NativeUnwindState,
     // Debug options
     filter_pids: HashMap<i32, bool>,
     // Profile channel
@@ -394,11 +398,21 @@ impl Profiler<'_> {
         let chan_send = Arc::new(Mutex::new(sender));
         let chan_receive = Arc::new(Mutex::new(receiver));
 
-        let live_shard = Arc::new(Mutex::new(Vec::with_capacity(SHARD_CAPACITY)));
-        let build_id_to_executable_id = Arc::new(Mutex::new(HashMap::new()));
-        let shard_index = Arc::new(AtomicU64::new(0));
-        let low_index = Arc::new(AtomicU64::new(0));
-        let high_index = Arc::new(AtomicU64::new(0));
+        let live_shard = Vec::with_capacity(SHARD_CAPACITY);
+        let build_id_to_executable_id = HashMap::new();
+        let shard_index = 0;
+        let low_index = 0;
+        let high_index = 0;
+
+        let native_unwind_state = NativeUnwindState {
+            dirty: false,
+            last_persisted: Instant::now() - Duration::from_secs(1_000), // old enough to trigger it the first time
+            live_shard,
+            build_id_to_executable_id,
+            shard_index,
+            low_index,
+            high_index,
+        };
 
         let (sender, receiver) = mpsc::channel();
         let profile_send: Arc<Mutex<mpsc::Sender<_>>> = Arc::new(Mutex::new(sender));
@@ -413,13 +427,7 @@ impl Profiler<'_> {
             object_files,
             chan_send,
             chan_receive,
-            dirty: false,
-            last_persisted: Instant::now() - Duration::from_secs(1_000), // old enough to trigger it the first time
-            live_shard,
-            build_id_to_executable_id,
-            shard_index,
-            low_index,
-            high_index,
+            native_unwind_state,
             filter_pids,
             profile_send,
             profile_receive,
@@ -524,12 +532,12 @@ impl Profiler<'_> {
                 }
             }
 
-            if self.dirty && self.last_persisted.elapsed() > Duration::from_millis(100) {
-                let my_live_shard = self.live_shard.try_lock().unwrap();
-
-                self.persist_unwind_info(&my_live_shard);
-                self.dirty = false;
-                self.last_persisted = Instant::now();
+            if self.native_unwind_state.dirty
+                && self.native_unwind_state.last_persisted.elapsed() > Duration::from_millis(100)
+            {
+                self.persist_unwind_info(&self.native_unwind_state.live_shard);
+                self.native_unwind_state.dirty = false;
+                self.native_unwind_state.last_persisted = Instant::now();
             }
         }
     }
@@ -614,7 +622,7 @@ impl Profiler<'_> {
         println!("calling persist!");
         let start = Instant::now();
 
-        let key = &self.shard_index.load(Ordering::SeqCst).to_ne_bytes();
+        let key = self.native_unwind_state.shard_index.to_ne_bytes();
         let val = unsafe {
             // Probs we need to zero this mem?
             std::slice::from_raw_parts(
@@ -626,7 +634,7 @@ impl Profiler<'_> {
         self.bpf
             .maps()
             .unwind_tables()
-            .update(key, val, MapFlags::ANY)
+            .update(&key, val, MapFlags::ANY)
             .expect("update"); // error with  value: System(7)', src/main.rs:663:26
 
         println!("persist_unwind_info took {:?}", start.elapsed());
@@ -640,8 +648,6 @@ impl Profiler<'_> {
         // Local unwind info state
         let mut dwarf_mappings = Vec::with_capacity(MAX_MAPPINGS_PER_PROCESS as usize);
         let mut num_mappings: u32 = 0;
-        let mut my_live_shard: std::sync::MutexGuard<'_, Vec<stack_unwind_row_t>> =
-            self.live_shard.lock().unwrap();
 
         // hack for kworkers and such
         let mut got_some_unwind_info: bool = true;
@@ -657,7 +663,7 @@ impl Profiler<'_> {
             .iter()
             .enumerate()
         {
-            if self.shard_index.clone().load(Ordering::SeqCst) > MAX_UNWIND_INFO_SHARDS {
+            if self.native_unwind_state.shard_index > MAX_UNWIND_INFO_SHARDS {
                 println!("No more unwind info shards available");
                 break;
             }
@@ -715,11 +721,12 @@ impl Profiler<'_> {
             // Avoid deadlock
             std::mem::drop(my_lock);
 
-            let build_id_to_executable_id_clone = self.build_id_to_executable_id.clone();
-            let mut build_id_to_executable_id = build_id_to_executable_id_clone.lock().unwrap();
-
             let build_id = mapping.build_id.clone().unwrap();
-            match build_id_to_executable_id.get(&build_id) {
+            match self
+                .native_unwind_state
+                .build_id_to_executable_id
+                .get(&build_id)
+            {
                 Some(executable_id) => {
                     // println!("==== in cache");
                     // == Add mapping
@@ -745,7 +752,7 @@ impl Profiler<'_> {
                 load_address,
                 begin: mapping.start_addr,
                 end: mapping.end_addr,
-                executable_id: build_id_to_executable_id.len() as u32,
+                executable_id: self.native_unwind_state.build_id_to_executable_id.len() as u32,
                 type_: 0, // normal i think
             });
             num_mappings += 1;
@@ -774,13 +781,10 @@ impl Profiler<'_> {
                 "\n======== Unwind rows for executable {}: {} with id {}",
                 obj_path.display(),
                 &found_unwind_info.len(),
-                build_id_to_executable_id.len(),
+                self.native_unwind_state.build_id_to_executable_id.len(),
             );
 
-            println!(
-                "~~ shard index: {}",
-                self.shard_index.load(Ordering::SeqCst)
-            );
+            println!("~~ shard index: {}", self.native_unwind_state.shard_index);
 
             // no unwind info / errors
             if found_unwind_info.is_empty() {
@@ -799,30 +803,33 @@ impl Profiler<'_> {
                     break;
                 }
 
-                let max_space: usize = SHARD_CAPACITY - my_live_shard.len();
+                let max_space: usize = SHARD_CAPACITY - self.native_unwind_state.live_shard.len();
                 let available_space: usize = std::cmp::min(max_space, rest_chunk.len());
-                println!("-- space used so far in live shard {}", my_live_shard.len());
+                println!(
+                    "-- space used so far in live shard {}",
+                    self.native_unwind_state.live_shard.len()
+                );
                 println!(
                     "-- live shard space left {}, rest_chunk size: {}",
                     max_space,
                     rest_chunk.len()
                 );
 
-                if self.shard_index.clone().load(Ordering::SeqCst) > 49 {
+                if self.native_unwind_state.shard_index > 49 {
                     println!("[info unwind ]too many shards");
                     break;
                 }
 
                 if available_space == 0 {
                     println!("!!!! [not fully implemented] no space in live shard");
-                    self.low_index.store(0_u64, Ordering::SeqCst);
-                    self.high_index.store(0_u64, Ordering::SeqCst);
+                    self.native_unwind_state.low_index = 0;
+                    self.native_unwind_state.high_index = 0;
 
-                    self.persist_unwind_info(&my_live_shard);
+                    self.persist_unwind_info(&self.native_unwind_state.live_shard);
 
-                    my_live_shard.truncate(0); // Vec::with_capacity(250_000);
-                                               // - create shard (check if over limit)
-                    self.shard_index.clone().fetch_add(1, Ordering::SeqCst);
+                    self.native_unwind_state.live_shard.truncate(0); // Vec::with_capacity(250_000);
+                                                                     // - create shard (check if over limit)
+                    self.native_unwind_state.shard_index = 0;
                     continue;
                 }
                 let candidate_chunk: &[stack_unwind_row_t] = &rest_chunk[..available_space];
@@ -838,16 +845,16 @@ impl Profiler<'_> {
 
                 if real_offset == 0 {
                     println!("[dwarf-debug] we need a new shard, could not find marker!");
-                    self.low_index.clone().store(0_u64, Ordering::SeqCst);
-                    self.high_index.clone().store(0_u64, Ordering::SeqCst);
-                    self.dirty = true;
+                    self.native_unwind_state.low_index = 0;
+                    self.native_unwind_state.high_index = 0;
+                    self.native_unwind_state.dirty = true;
 
-                    self.persist_unwind_info(&my_live_shard);
+                    self.persist_unwind_info(&self.native_unwind_state.live_shard);
 
                     // - clear / reset
-                    my_live_shard.truncate(0); //= Vec::with_capacity(250_000);
-                                               // - create shard (check if over limit)
-                    self.shard_index.fetch_add(1, Ordering::SeqCst);
+                    self.native_unwind_state.live_shard.truncate(0); //= Vec::with_capacity(250_000);
+                                                                     // - create shard (check if over limit)
+                    self.native_unwind_state.shard_index += 1;
                     continue;
                 }
 
@@ -869,22 +876,23 @@ impl Profiler<'_> {
                     );
                 } */
 
-                let _prev_index = my_live_shard.len();
-                self.low_index
-                    .store(my_live_shard.len() as u64, Ordering::SeqCst);
+                let _prev_index = self.native_unwind_state.live_shard.len();
+                self.native_unwind_state.low_index =
+                    self.native_unwind_state.live_shard.len() as u64;
 
                 // Copy unwind info to the live shard
-                my_live_shard.append(&mut current_chunk.to_vec());
+                self.native_unwind_state
+                    .live_shard
+                    .append(&mut current_chunk.to_vec());
                 /*
-                if my_live_shard[prev_index].cfa_type == CfaType::EndFdeMarker as u8 {
+                if live_shard[prev_index].cfa_type == CfaType::EndFdeMarker as u8 {
                     panic!("wrong start of unwind info");
                 } */
-                self.high_index
-                    .clone()
-                    .store((my_live_shard.len() - 1) as u64, Ordering::SeqCst);
+                self.native_unwind_state.high_index =
+                    self.native_unwind_state.live_shard.len() as u64 - 1;
 
-                /*                 if my_live_shard[my_live_shard.len() - 1].cfa_type != CfaType::EndFdeMarker as u8 {
-                                   panic!("wrong end of my_live_shard");
+                /*                 if live_shard[live_shard.len() - 1].cfa_type != CfaType::EndFdeMarker as u8 {
+                                   panic!("wrong end of live_shard");
                                }
                 */
                 // == Add chunks
@@ -892,15 +900,14 @@ impl Profiler<'_> {
                 chunks.push(chunk_info_t {
                     low_pc: current_chunk[0].pc,
                     high_pc: current_chunk[current_chunk.len() - 1].pc,
-                    shard_index: self.shard_index.clone().load(Ordering::SeqCst),
-                    low_index: self.low_index.clone().load(Ordering::SeqCst),
-                    high_index: self.high_index.clone().load(Ordering::SeqCst),
+                    shard_index: self.native_unwind_state.shard_index,
+                    low_index: self.native_unwind_state.low_index,
+                    high_index: self.native_unwind_state.high_index,
                 });
 
                 println!(
                     "-- indices ([{}:{}])",
-                    self.low_index.clone().load(Ordering::SeqCst),
-                    self.high_index.clone().load(Ordering::SeqCst)
+                    self.native_unwind_state.low_index, self.native_unwind_state.high_index,
                 );
             }
 
@@ -925,18 +932,21 @@ impl Profiler<'_> {
                 .maps()
                 .unwind_info_chunks()
                 .update(
-                    &(build_id_to_executable_id.len() as u32).to_ne_bytes(),
+                    &(self.native_unwind_state.build_id_to_executable_id.len() as u32)
+                        .to_ne_bytes(),
                     unsafe { plain::as_bytes(&all_chunks) },
                     MapFlags::ANY,
                 )
                 .unwrap();
 
-            let executable_id = build_id_to_executable_id.len();
-            build_id_to_executable_id.insert(build_id, executable_id as u32);
+            let executable_id = self.native_unwind_state.build_id_to_executable_id.len();
+            self.native_unwind_state
+                .build_id_to_executable_id
+                .insert(build_id, executable_id as u32);
         } // Added all mappings
 
         if got_some_unwind_info {
-            self.dirty = true;
+            self.native_unwind_state.dirty = true;
 
             // == Add process info
             // "default"
