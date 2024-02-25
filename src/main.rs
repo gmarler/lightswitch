@@ -17,6 +17,8 @@ struct Args {
     show_unwind_info: Option<String>,
     #[arg(long)]
     show_info: Option<String>,
+    #[arg(long)]
+    continuous: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -36,12 +38,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let mut duration = Duration::MAX;
+    if !args.continuous {
+        duration = Duration::from_secs(3);
+    }
+
     let collector = Collector::new();
 
     let mut p: Profiler<'_> = Profiler::new();
     p.profile_pids(args.pids);
-    p.run(Duration::from_secs(3), collector.clone());
 
+    p.run(duration, collector.clone());
     collector.lock().unwrap().finish();
 
     Ok(())

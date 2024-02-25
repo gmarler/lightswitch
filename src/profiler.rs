@@ -17,8 +17,7 @@ use std::fs;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -32,7 +31,7 @@ fn show_profile(
     objs: &HashMap<String, ObjectFileInfo>,
 ) {
     let mut addresses_per_sample: HashMap<PathBuf, HashMap<u64, String>> = HashMap::new();
-    symbolize_profile(&mut addresses_per_sample, procs, objs, profile);
+    symbolize_profile(&mut addresses_per_sample, procs, objs, profile).expect("symbolize");
 
     for sample in profile {
         let task_id = sample.pid;
@@ -97,10 +96,9 @@ fn symbolize_profile(
                                 - obj.elf_load.0
                                 + obj.elf_load.1;
 
-                            let key = (obj.path.clone());
-                            let mut addrs: &mut HashMap<u64, String> = addresses_per_sample
-                                .entry(key)
-                                .or_insert_with(|| HashMap::new());
+                            let key = obj.path.clone();
+                            let addrs: &mut HashMap<u64, String> =
+                                addresses_per_sample.entry(key).or_default();
                             addrs.insert(normalized_addr, "".to_string());
                         }
                         None => {
@@ -118,7 +116,7 @@ fn symbolize_profile(
     // second pass, symbolize
     for (path, addr_to_symbol_mapping) in addresses_per_sample.iter_mut() {
         let addresses = addr_to_symbol_mapping.iter().map(|a| *a.0 - 1).collect();
-        let symbols = symbolize_native_stack_blaze(addresses, &path);
+        let symbols = symbolize_native_stack_blaze(addresses, path);
         for (addr, symbol) in addr_to_symbol_mapping.clone().iter_mut().zip(symbols) {
             addr_to_symbol_mapping.insert(*addr.0, symbol.to_string());
         }
@@ -646,7 +644,7 @@ impl Profiler<'_> {
         }
 
         // Local unwind info state
-        let mut dwarf_mappings = Vec::with_capacity(MAX_MAPPINGS_PER_PROCESS as usize);
+        let mut mappings = Vec::with_capacity(MAX_MAPPINGS_PER_PROCESS as usize);
         let mut num_mappings: u32 = 0;
 
         // hack for kworkers and such
@@ -671,7 +669,7 @@ impl Profiler<'_> {
             // Skip vdso / jit mappings
             match mapping.kind {
                 MappingType::Anonymous => {
-                    dwarf_mappings.push(mapping_t {
+                    mappings.push(mapping_t {
                         load_address: 0,
                         begin: mapping.start_addr,
                         end: mapping.end_addr,
@@ -682,7 +680,7 @@ impl Profiler<'_> {
                     continue;
                 }
                 MappingType::Vdso => {
-                    dwarf_mappings.push(mapping_t {
+                    mappings.push(mapping_t {
                         load_address: 0,
                         begin: mapping.start_addr,
                         end: mapping.end_addr,
@@ -730,7 +728,7 @@ impl Profiler<'_> {
                 Some(executable_id) => {
                     // println!("==== in cache");
                     // == Add mapping
-                    dwarf_mappings.push(mapping_t {
+                    mappings.push(mapping_t {
                         load_address,
                         begin: mapping.start_addr,
                         end: mapping.end_addr,
@@ -743,12 +741,10 @@ impl Profiler<'_> {
                 None => {}
             }
 
-            // This will be populated once we start chunking the unwind info
-            // we don't do this yet
             let mut chunks = Vec::with_capacity(MAX_UNWIND_TABLE_CHUNKS as usize);
 
             // == Add mapping
-            dwarf_mappings.push(mapping_t {
+            mappings.push(mapping_t {
                 load_address,
                 begin: mapping.start_addr,
                 end: mapping.end_addr,
@@ -775,7 +771,6 @@ impl Profiler<'_> {
                 let b_pc = b.pc;
                 a_pc.cmp(&b_pc)
             });
-            // validate_unwind_info(&found_unwind_info);
 
             println!(
                 "\n======== Unwind rows for executable {}: {} with id {}",
@@ -796,7 +791,9 @@ impl Profiler<'_> {
             let last_pc = found_unwind_info[found_unwind_info.len() - 1].pc;
             println!("~~ PC range {:x}-{:x}", first_pc, last_pc,);
 
+            let mut current_chunk = &found_unwind_info[..];
             let mut rest_chunk = &found_unwind_info[..];
+
             loop {
                 if rest_chunk.is_empty() {
                     println!("[info-unwind] done chunkin'");
@@ -815,8 +812,8 @@ impl Profiler<'_> {
                     rest_chunk.len()
                 );
 
-                if self.native_unwind_state.shard_index > 49 {
-                    println!("[info unwind ]too many shards");
+                if self.native_unwind_state.shard_index > MAX_UNWIND_INFO_SHARDS {
+                    println!("[info unwind] too many shards");
                     break;
                 }
 
@@ -832,51 +829,55 @@ impl Profiler<'_> {
                     self.native_unwind_state.shard_index = 0;
                     continue;
                 }
-                let candidate_chunk: &[stack_unwind_row_t] = &rest_chunk[..available_space];
+                let candidate_unwind_info: &[stack_unwind_row_t] = &rest_chunk[..available_space];
 
-                let mut real_offset = 0;
-                for (i, row) in candidate_chunk.iter().enumerate().rev() {
-                    // println!("- {} {:?}", i, row.cfa_type);
+                let mut last_marker_index = None;
+                for (i, row) in candidate_unwind_info.iter().enumerate().rev() {
                     if row.cfa_type == CfaType::EndFdeMarker as u8 {
-                        real_offset = i;
+                        last_marker_index = Some(i);
                         break;
                     }
                 }
 
-                if real_offset == 0 {
-                    println!("[dwarf-debug] we need a new shard, could not find marker!");
-                    self.native_unwind_state.low_index = 0;
-                    self.native_unwind_state.high_index = 0;
-                    self.native_unwind_state.dirty = true;
+                match last_marker_index {
+                    Some(last_marker_index) => {
+                        current_chunk = &rest_chunk[..=last_marker_index];
+                        rest_chunk = &rest_chunk[(last_marker_index + 1)..];
+                        println!(
+                            "-- current_chunk.len {} rest_chunk.len {}",
+                            current_chunk.len(),
+                            rest_chunk.len()
+                        );
 
-                    self.persist_unwind_info(&self.native_unwind_state.live_shard);
+                        if current_chunk[0].cfa_type == CfaType::EndFdeMarker as u8 {
+                            panic!("wrong start of unwind info {:?}", current_chunk[0].cfa_type);
+                        }
+                        if current_chunk[current_chunk.len() - 1].cfa_type
+                            != CfaType::EndFdeMarker as u8
+                        {
+                            panic!(
+                                "wrong end of unwind info {:?}",
+                                current_chunk[current_chunk.len() - 1].cfa_type
+                            );
+                        }
+                    }
 
-                    // - clear / reset
-                    self.native_unwind_state.live_shard.truncate(0); //= Vec::with_capacity(250_000);
-                                                                     // - create shard (check if over limit)
-                    self.native_unwind_state.shard_index += 1;
-                    continue;
+                    None => {
+                        println!("[dwarf-debug] could not find marker, allocating a new shard. live shard len: {}", self.native_unwind_state.live_shard.len());
+                        self.native_unwind_state.low_index = 0;
+                        self.native_unwind_state.high_index = 0;
+                        self.native_unwind_state.dirty = true;
+
+                        self.persist_unwind_info(&self.native_unwind_state.live_shard);
+
+                        // - clear / reset
+                        self.native_unwind_state.live_shard.truncate(0);
+                        // - create shard (check if over limit)
+                        self.native_unwind_state.shard_index += 1;
+                        continue;
+                    }
                 }
 
-                let current_chunk = &rest_chunk[..=real_offset];
-                rest_chunk = &rest_chunk[(real_offset + 1)..];
-                println!(
-                    "-- current_chunk.len {} rest_chunk.len {}",
-                    current_chunk.len(),
-                    rest_chunk.len()
-                );
-
-                /*                 if current_chunk[0].cfa_type == CfaType::EndFdeMarker as u8 {
-                    panic!("wrong start of unwind info {:?}", current_chunk[0].cfa_type);
-                }
-                if current_chunk[current_chunk.len() - 1].cfa_type != CfaType::EndFdeMarker as u8 {
-                    panic!(
-                        "wrong end of unwind info {:?}",
-                        current_chunk[current_chunk.len() - 1].cfa_type
-                    );
-                } */
-
-                let _prev_index = self.native_unwind_state.live_shard.len();
                 self.native_unwind_state.low_index =
                     self.native_unwind_state.live_shard.len() as u64;
 
@@ -884,19 +885,10 @@ impl Profiler<'_> {
                 self.native_unwind_state
                     .live_shard
                     .append(&mut current_chunk.to_vec());
-                /*
-                if live_shard[prev_index].cfa_type == CfaType::EndFdeMarker as u8 {
-                    panic!("wrong start of unwind info");
-                } */
                 self.native_unwind_state.high_index =
                     self.native_unwind_state.live_shard.len() as u64 - 1;
 
-                /*                 if live_shard[live_shard.len() - 1].cfa_type != CfaType::EndFdeMarker as u8 {
-                                   panic!("wrong end of live_shard");
-                               }
-                */
-                // == Add chunks
-                // Right now we only fnhave one
+                // == Add chunk
                 chunks.push(chunk_info_t {
                     low_pc: current_chunk[0].pc,
                     high_pc: current_chunk[current_chunk.len() - 1].pc,
@@ -912,7 +904,6 @@ impl Profiler<'_> {
             }
 
             // == Add chunks
-            // "default"
             chunks.resize(
                 MAX_UNWIND_TABLE_CHUNKS as usize,
                 chunk_info_t {
@@ -923,8 +914,10 @@ impl Profiler<'_> {
                     high_index: 0,
                 },
             );
+
             let all_chunks_boxed: Box<[chunk_info_t; MAX_UNWIND_TABLE_CHUNKS as usize]> =
                 chunks.try_into().expect("try into");
+
             let all_chunks = unwind_info_chunks_t {
                 chunks: *all_chunks_boxed,
             };
@@ -950,7 +943,7 @@ impl Profiler<'_> {
 
             // == Add process info
             // "default"
-            dwarf_mappings.resize(
+            mappings.resize(
                 MAX_MAPPINGS_PER_PROCESS as usize,
                 mapping_t {
                     load_address: 0,
@@ -960,7 +953,7 @@ impl Profiler<'_> {
                     type_: 0,
                 },
             );
-            let boxed_slice = dwarf_mappings.into_boxed_slice();
+            let boxed_slice = mappings.into_boxed_slice();
             let boxed_array: Box<[mapping_t; MAX_MAPPINGS_PER_PROCESS as usize]> =
                 boxed_slice.try_into().expect("try into");
             let proc_info = process_info_t {
