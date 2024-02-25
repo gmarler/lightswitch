@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut p: Profiler<'_> = Profiler::new();
     p.profile_pids(args.pids);
-    p.run(Duration::from_secs(5), collector.clone());
+    p.run(Duration::from_secs(3), collector.clone());
 
     collector.lock().unwrap().finish();
 

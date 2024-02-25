@@ -4,7 +4,7 @@ use crate::perf_events::setup_perf_event;
 use crate::unwind_info::{
     end_of_function_marker, CfaType, CompactUnwindRow, UnwindData, UnwindInfoBuilder,
 };
-use crate::usym::symbolize_native_stack;
+use crate::usym::symbolize_native_stack_blaze;
 use anyhow::anyhow;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::SkelBuilder;
@@ -31,12 +31,15 @@ fn show_profile(
     procs: &HashMap<i32, ProcessInfo>,
     objs: &HashMap<String, ObjectFileInfo>,
 ) {
-    for sample in profile {
-        let task_id = sample.0;
-        let Some(ustack) = sample.1 else { return };
-        let _kstack = sample.2;
+    let mut addresses_per_sample: HashMap<PathBuf, HashMap<u64, String>> = HashMap::new();
+    symbolize_profile(&mut addresses_per_sample, procs, objs, profile);
 
-        let _ = show_native_stack(procs, objs, task_id, &ustack);
+    for sample in profile {
+        let task_id = sample.pid;
+        let Some(ustack) = sample.ustack else { return };
+        let _kstack = sample.kstack;
+
+        let _ = show_native_stack(&mut addresses_per_sample, procs, objs, task_id, &ustack);
     }
 }
 
@@ -56,7 +59,76 @@ fn find_mapping(mappings: &[ExecutableMapping], addr: u64) -> Option<ExecutableM
     Some(found_mapping.clone())
 }
 
+fn symbolize_profile(
+    addresses_per_sample: &mut HashMap<PathBuf, HashMap<u64, String>>,
+    procs: &HashMap<i32, ProcessInfo>,
+    objs: &HashMap<String, ObjectFileInfo>,
+    profile: &RawProfile,
+) -> anyhow::Result<()> {
+    // fill addresses_per_sample
+    for sample in profile {
+        let native_stack = sample.ustack.unwrap();
+        let task_id = sample.pid;
+
+        let p = procfs::process::Process::new(task_id)?;
+        let status = p.status()?;
+        let tgid = status.tgid;
+
+        for (i, addr) in native_stack.addresses.into_iter().enumerate() {
+            if native_stack.len <= i.try_into().unwrap() {
+                break;
+            }
+
+            let Some(info) = procs.get(&tgid) else {
+                return Err(anyhow!("process not found"));
+            };
+
+            let Some(mapping) = find_mapping(&info.mappings, addr) else {
+                return Err(anyhow!("could not find mapping"));
+            };
+
+            match &mapping.build_id {
+                Some(build_id) => {
+                    match objs.get(build_id) {
+                        Some(obj) => {
+                            // We need the normalized address for normal object files
+                            // and might need the absolute addresses for JITs
+                            let normalized_addr = addr - mapping.start_addr + mapping.offset
+                                - obj.elf_load.0
+                                + obj.elf_load.1;
+
+                            let key = (obj.path.clone());
+                            let mut addrs: &mut HashMap<u64, String> = addresses_per_sample
+                                .entry(key)
+                                .or_insert_with(|| HashMap::new());
+                            addrs.insert(normalized_addr, "".to_string());
+                        }
+                        None => {
+                            println!("\t\t - [no build id found]");
+                        }
+                    }
+                }
+                None => {
+                    println!("\t\t - mapping is not backed by a file, could be a JIT segment");
+                }
+            }
+        }
+    }
+
+    // second pass, symbolize
+    for (path, addr_to_symbol_mapping) in addresses_per_sample.iter_mut() {
+        let addresses = addr_to_symbol_mapping.iter().map(|a| *a.0 - 1).collect();
+        let symbols = symbolize_native_stack_blaze(addresses, &path);
+        for (addr, symbol) in addr_to_symbol_mapping.clone().iter_mut().zip(symbols) {
+            addr_to_symbol_mapping.insert(*addr.0, symbol.to_string());
+        }
+    }
+
+    Ok(())
+}
+
 fn show_native_stack(
+    addresses_per_sample: &mut HashMap<PathBuf, HashMap<u64, String>>,
     procs: &HashMap<i32, ProcessInfo>,
     objs: &HashMap<String, ObjectFileInfo>,
     task_id: i32,
@@ -81,31 +153,29 @@ fn show_native_stack(
             return Err(anyhow!("could not find mapping"));
         };
 
+        // finally
         match &mapping.build_id {
-            Some(build_id) => {
-                match objs.get(build_id) {
-                    Some(obj) => {
-                        // We need the normalized address for normal object files
-                        // and might need the absolute addresses for JITs
-                        let normalized_addr = addr - mapping.start_addr + mapping.offset
-                            - obj.elf_load.0
-                            + obj.elf_load.1;
+            Some(build_id) => match objs.get(build_id) {
+                Some(obj) => {
+                    let normalized_addr = addr - mapping.start_addr + mapping.offset
+                        - obj.elf_load.0
+                        + obj.elf_load.1;
 
-                        let func_name: Vec<String> =
-                            symbolize_native_stack(vec![normalized_addr], &obj.path);
-                        println!("\t\t - {}", func_name[0]);
-                    }
-                    None => {
-                        println!("\t\t - [no build id found]");
-                    }
+                    let name = addresses_per_sample
+                        .get(&obj.path)
+                        .unwrap()
+                        .get(&normalized_addr);
+                    println!("\t\t - {:?}", name);
                 }
-            }
+                None => {
+                    println!("\t\t - [no build id found]");
+                }
+            },
             None => {
                 println!("\t\t - mapping is not backed by a file, could be a JIT segment");
             }
         }
     }
-
     Ok(())
 }
 
@@ -260,7 +330,7 @@ impl Collector {
         procs: &HashMap<i32, ProcessInfo>,
         objs: &HashMap<String, ObjectFileInfo>,
     ) {
-        self.profiles.push(profile.clone());
+        self.profiles.push(profile);
 
         for (k, v) in procs {
             self.procs.insert(*k, v.clone());
@@ -286,8 +356,6 @@ impl Collector {
         for profile in &self.profiles {
             show_profile(profile, &self.procs, &self.objs);
         }
-
-        thread::sleep(Duration::from_secs(5));
     }
 }
 
@@ -297,7 +365,14 @@ const MAX_UNWIND_INFO_SHARDS: u64 = 50;
 const SHARD_CAPACITY: usize = MAX_UNWIND_TABLE_SIZE as usize;
 const PERF_BUFFER_PAGES: usize = 512 * 1024;
 
-type RawProfile = Vec<(i32, Option<native_stack_t>, Option<native_stack_t>, u64)>;
+struct RawSample {
+    pid: i32,
+    ustack: Option<native_stack_t>,
+    kstack: Option<native_stack_t>,
+    count: u64,
+}
+
+type RawProfile = Vec<RawSample>;
 
 impl Default for Profiler<'_> {
     fn default() -> Self {
@@ -464,7 +539,7 @@ impl Profiler<'_> {
 
         self.teardown_perf_events();
 
-        let mut result: RawProfile = Vec::new();
+        let mut result = Vec::new();
         let maps = self.bpf.maps();
         let aggregated_stacks = maps.aggregated_stacks();
         let stacks = maps.stacks();
@@ -478,7 +553,7 @@ impl Profiler<'_> {
 
                     let key: &stack_count_key_t =
                         plain::from_bytes(&aggregated_stack_key_bytes).unwrap();
-                    let value: &u64 = plain::from_bytes(&aggregated_value_bytes).unwrap();
+                    let count: &u64 = plain::from_bytes(&aggregated_value_bytes).unwrap();
 
                     all_stacks_bytes.push(aggregated_stack_key_bytes.clone());
 
@@ -506,7 +581,14 @@ impl Profiler<'_> {
                         }
                     }
 
-                    result.push((key.task_id, result_ustack, result_kstack, *value))
+                    let raw_sample = RawSample {
+                        pid: key.task_id,
+                        ustack: result_ustack,
+                        kstack: result_kstack,
+                        count: *count,
+                    };
+
+                    result.push(raw_sample);
                 }
                 _ => continue,
             }
