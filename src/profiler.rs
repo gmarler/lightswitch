@@ -1,3 +1,5 @@
+use tracing::{span, Level, info, error, debug};
+
 use crate::bpf::bpf::{ProfilerSkel, ProfilerSkelBuilder};
 use crate::object::{build_id, elf_load, is_dynamic, is_go};
 use crate::perf_events::setup_perf_event;
@@ -262,7 +264,7 @@ fn in_memory_unwind_info(path: &str) -> anyhow::Result<Vec<stack_unwind_row_t>> 
     builder?.process()?;
 
     if last_function_end_addr.is_none() {
-        println!("no last func end addr");
+        error!("no last func end addr");
         return Err(anyhow!("not sure what's going on"));
     }
 
@@ -353,7 +355,9 @@ impl Collector {
     }
 
     pub fn finish(&self) {
-        println!("Collector::finish {}", self.profiles.len());
+        let span: span::EnteredSpan = span!(Level::DEBUG, "symbolize_profiles").entered();
+
+        debug!("Collector::finish {}", self.profiles.len());
 
         for profile in &self.profiles {
             show_profile(profile, &self.procs, &self.objs);
@@ -378,14 +382,14 @@ type RawProfile = Vec<RawSample>;
 
 impl Default for Profiler<'_> {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
 impl Profiler<'_> {
-    pub fn new() -> Self {
-        let mut skel_builder = ProfilerSkelBuilder::default();
-        skel_builder.obj_builder.debug(true);
+    pub fn new(bpf_debug: bool) -> Self {
+        let mut skel_builder: ProfilerSkelBuilder = ProfilerSkelBuilder::default();
+        skel_builder.obj_builder.debug(bpf_debug);
         let open_skel = skel_builder.open().expect("open skel");
         let bpf = open_skel.load().expect("load skel");
 
@@ -487,42 +491,37 @@ impl Profiler<'_> {
         let mut start = Instant::now();
 
         loop {
-            println!("main loop {:?}", start.elapsed());
             if start.elapsed() >= duration {
-                println!("done after running for {:?}", start.elapsed());
+                debug!("done after running for {:?}", start.elapsed());
                 let profile = self.collect_profile();
                 self.send_profile(profile);
                 break;
             }
 
-            println!("== elapsed {:?}", start.elapsed());
             if start.elapsed() >= Duration::from_secs(5) {
                 let profile = self.collect_profile();
                 self.send_profile(profile);
                 start = Instant::now();
             }
 
-            let s = Instant::now();
             let read = self.chan_receive.lock().expect("receive lock").try_recv();
-            println!("event_new_proc lock took {:?}", s.elapsed());
 
             match read {
                 Ok(event) => {
                     let pid = event.pid;
 
                     if event.type_ == event_type_EVENT_NEW_PROCESS {
-                        let s = Instant::now();
+                        // let span = span!(Level::DEBUG, "calling event_new_proc").entered();
                         self.event_new_proc(pid);
-                        let mut pname = "<unknown>".to_string();
-                        if let Ok(proc) = procfs::process::Process::new(pid) {
+
+                        //let mut pname = "<unknown>".to_string();
+/*                         if let Ok(proc) = procfs::process::Process::new(pid) {
                             if let Ok(name) = proc.cmdline() {
                                 pname = name.join("").to_string();
                             }
-                        }
-
-                        println!("event_new_proc took {:?} for {}", s.elapsed(), pname);
+                        } */
                     } else {
-                        println!("unknow event {}", event.type_);
+                        error!("unknow event {}", event.type_);
                     }
                 }
                 Err(_) => {
@@ -541,7 +540,7 @@ impl Profiler<'_> {
     }
 
     pub fn collect_profile(&mut self) -> RawProfile {
-        println!("collecting profile");
+        debug!("collecting profile");
 
         self.teardown_perf_events();
 
@@ -600,7 +599,7 @@ impl Profiler<'_> {
             }
         }
 
-        println!("===== got {} unique stacks", all_stacks_bytes.len());
+        debug!("===== got {} unique stacks", all_stacks_bytes.len());
 
         // Now we should delete these entries. We should ensure that this is correct and safe
         // as we are iterating while still profiling
@@ -617,8 +616,7 @@ impl Profiler<'_> {
     }
 
     fn persist_unwind_info(&self, live_shard: &Vec<stack_unwind_row_t>) {
-        println!("calling persist!");
-        let start = Instant::now();
+        let span = span!(Level::DEBUG, "persist_unwind_info").entered();
 
         let key = self.native_unwind_state.shard_index.to_ne_bytes();
         let val = unsafe {
@@ -634,8 +632,6 @@ impl Profiler<'_> {
             .unwind_tables()
             .update(&key, val, MapFlags::ANY)
             .expect("update"); // error with  value: System(7)', src/main.rs:663:26
-
-        println!("persist_unwind_info took {:?}", start.elapsed());
     }
 
     fn add_unwind_info(&mut self, pid: i32) {
@@ -662,7 +658,7 @@ impl Profiler<'_> {
             .enumerate()
         {
             if self.native_unwind_state.shard_index > MAX_UNWIND_INFO_SHARDS {
-                println!("No more unwind info shards available");
+                error!("No more unwind info shards available");
                 break;
             }
 
@@ -736,9 +732,12 @@ impl Profiler<'_> {
                         type_: 0, // normal i think
                     });
                     num_mappings += 1;
+                    debug!("unwind info CACHED for executable");
                     continue;
                 }
-                None => {}
+                None => {
+                    debug!("unwind info not found for executable");
+                }
             }
 
             let mut chunks = Vec::with_capacity(MAX_UNWIND_TABLE_CHUNKS as usize);
@@ -760,26 +759,34 @@ impl Profiler<'_> {
 
             // == Fetch unwind info, so far, this is in mem
             // todo, pass file handle
+            let span = span!(Level::DEBUG, "calling in_memory_unwind_info", "{}", first_mapping.path.to_string_lossy()).entered();
+
             let Ok(mut found_unwind_info) =
                 in_memory_unwind_info(&first_mapping.path.to_string_lossy())
             else {
                 continue;
             };
+            span.exit();
 
+
+            let span: span::EnteredSpan = span!(Level::DEBUG, "unwind info sort").entered();
             found_unwind_info.sort_by(|a, b| {
                 let a_pc = a.pc;
                 let b_pc = b.pc;
                 a_pc.cmp(&b_pc)
             });
+            span.exit();
 
-            println!(
-                "\n======== Unwind rows for executable {}: {} with id {}",
+
+
+            debug!(
+                "======== Unwind rows for executable {}: {} with id {}",
                 obj_path.display(),
                 &found_unwind_info.len(),
                 self.native_unwind_state.build_id_to_executable_id.len(),
             );
 
-            println!("~~ shard index: {}", self.native_unwind_state.shard_index);
+            debug!("~~ shard index: {}", self.native_unwind_state.shard_index);
 
             // no unwind info / errors
             if found_unwind_info.is_empty() {
@@ -789,36 +796,36 @@ impl Profiler<'_> {
 
             let first_pc = found_unwind_info[0].pc;
             let last_pc = found_unwind_info[found_unwind_info.len() - 1].pc;
-            println!("~~ PC range {:x}-{:x}", first_pc, last_pc,);
+            debug!("~~ PC range {:x}-{:x}", first_pc, last_pc,);
 
             let mut current_chunk = &found_unwind_info[..];
             let mut rest_chunk = &found_unwind_info[..];
 
             loop {
                 if rest_chunk.is_empty() {
-                    println!("[info-unwind] done chunkin'");
+                    debug!("[info-unwind] done chunkin'");
                     break;
                 }
 
                 let max_space: usize = SHARD_CAPACITY - self.native_unwind_state.live_shard.len();
                 let available_space: usize = std::cmp::min(max_space, rest_chunk.len());
-                println!(
+                debug!(
                     "-- space used so far in live shard {}",
                     self.native_unwind_state.live_shard.len()
                 );
-                println!(
+                debug!(
                     "-- live shard space left {}, rest_chunk size: {}",
                     max_space,
                     rest_chunk.len()
                 );
 
                 if self.native_unwind_state.shard_index > MAX_UNWIND_INFO_SHARDS {
-                    println!("[info unwind] too many shards");
+                    error!("[info unwind] too many shards");
                     break;
                 }
 
                 if available_space == 0 {
-                    println!("!!!! [not fully implemented] no space in live shard");
+                    debug!("!!!! [not fully implemented] no space in live shard");
                     self.native_unwind_state.low_index = 0;
                     self.native_unwind_state.high_index = 0;
 
@@ -843,7 +850,7 @@ impl Profiler<'_> {
                     Some(last_marker_index) => {
                         current_chunk = &rest_chunk[..=last_marker_index];
                         rest_chunk = &rest_chunk[(last_marker_index + 1)..];
-                        println!(
+                        debug!(
                             "-- current_chunk.len {} rest_chunk.len {}",
                             current_chunk.len(),
                             rest_chunk.len()
@@ -863,7 +870,7 @@ impl Profiler<'_> {
                     }
 
                     None => {
-                        println!("[dwarf-debug] could not find marker, allocating a new shard. live shard len: {}", self.native_unwind_state.live_shard.len());
+                        debug!("[dwarf-debug] could not find marker, allocating a new shard. live shard len: {}", self.native_unwind_state.live_shard.len());
                         self.native_unwind_state.low_index = 0;
                         self.native_unwind_state.high_index = 0;
                         self.native_unwind_state.dirty = true;
@@ -897,7 +904,7 @@ impl Profiler<'_> {
                     high_index: self.native_unwind_state.high_index,
                 });
 
-                println!(
+                debug!(
                     "-- indices ([{}:{}])",
                     self.native_unwind_state.low_index, self.native_unwind_state.high_index,
                 );
@@ -1113,7 +1120,7 @@ impl Profiler<'_> {
     }
 
     fn handle_lost_events(cpu: i32, count: u64) {
-        println!("lost {count} events on cpu {cpu}");
+        error!("lost {count} events on cpu {cpu}");
     }
 
     pub fn set_bpf_map_info(&mut self) {
