@@ -1,4 +1,4 @@
-use tracing::{span, Level, info, error, debug};
+use tracing::{debug, error, info, span, Level};
 
 use crate::bpf::bpf::{ProfilerSkel, ProfilerSkelBuilder};
 use crate::object::{build_id, elf_load, is_dynamic, is_go};
@@ -27,21 +27,31 @@ use std::time::Instant;
 
 use crate::bpf::bindings::*;
 
-fn show_profile(
-    profile: &RawProfile,
+fn symbolize_profile(
+    profile: &RawAggregatedProfile,
     procs: &HashMap<i32, ProcessInfo>,
     objs: &HashMap<String, ObjectFileInfo>,
-) {
-    let mut addresses_per_sample: HashMap<PathBuf, HashMap<u64, String>> = HashMap::new();
-    symbolize_profile(&mut addresses_per_sample, procs, objs, profile).expect("symbolize");
+) -> SymbolizedAggregatedProfile {
+    let mut r = SymbolizedAggregatedProfile::new();
+    let mut addresses_per_sample = HashMap::new();
+
+    let _ = fetch_symbols_for_profile(&mut addresses_per_sample, profile, procs, objs); // best effort
 
     for sample in profile {
-        let task_id = sample.pid;
-        let Some(ustack) = sample.ustack else { return };
-        let _kstack = sample.kstack;
+        let mut symbolized_sample: SymbolizedAggregatedSample =
+            SymbolizedAggregatedSample::default();
+        symbolized_sample.pid = sample.pid;
+        symbolized_sample.count = sample.count;
 
-        let _ = show_native_stack(&mut addresses_per_sample, procs, objs, task_id, &ustack);
+        if let Some(ustack) = sample.ustack {
+            symbolized_sample.ustack =
+                symbolize_native_stack(&mut addresses_per_sample, procs, objs, sample.pid, &ustack);
+        };
+
+        r.push(symbolized_sample);
     }
+
+    r
 }
 
 fn find_mapping(mappings: &[ExecutableMapping], addr: u64) -> Option<ExecutableMapping> {
@@ -60,32 +70,35 @@ fn find_mapping(mappings: &[ExecutableMapping], addr: u64) -> Option<ExecutableM
     Some(found_mapping.clone())
 }
 
-fn symbolize_profile(
+fn fetch_symbols_for_profile(
     addresses_per_sample: &mut HashMap<PathBuf, HashMap<u64, String>>,
+    profile: &RawAggregatedProfile,
     procs: &HashMap<i32, ProcessInfo>,
     objs: &HashMap<String, ObjectFileInfo>,
-    profile: &RawProfile,
 ) -> anyhow::Result<()> {
-    // fill addresses_per_sample
     for sample in profile {
-        let native_stack = sample.ustack.unwrap();
+        let Some(native_stack) = sample.ustack else {
+            continue;
+        };
         let task_id = sample.pid;
 
+        // We should really continue
+        // Also it would be ideal not to have to query procfs again...
         let p = procfs::process::Process::new(task_id)?;
         let status = p.status()?;
         let tgid = status.tgid;
 
+        let Some(info) = procs.get(&tgid) else {
+            continue;
+        };
+
         for (i, addr) in native_stack.addresses.into_iter().enumerate() {
             if native_stack.len <= i.try_into().unwrap() {
-                break;
+                continue;
             }
 
-            let Some(info) = procs.get(&tgid) else {
-                return Err(anyhow!("process not found"));
-            };
-
             let Some(mapping) = find_mapping(&info.mappings, addr) else {
-                return Err(anyhow!("could not find mapping"));
+                continue; //return Err(anyhow!("could not find mapping"));
             };
 
             match &mapping.build_id {
@@ -99,9 +112,8 @@ fn symbolize_profile(
                                 + obj.elf_load.1;
 
                             let key = obj.path.clone();
-                            let addrs: &mut HashMap<u64, String> =
-                                addresses_per_sample.entry(key).or_default();
-                            addrs.insert(normalized_addr, "".to_string());
+                            let addrs = addresses_per_sample.entry(key).or_default();
+                            addrs.insert(normalized_addr, "".to_string()); // <- default value is a bit janky
                         }
                         None => {
                             println!("\t\t - [no build id found]");
@@ -118,7 +130,7 @@ fn symbolize_profile(
     // second pass, symbolize
     for (path, addr_to_symbol_mapping) in addresses_per_sample.iter_mut() {
         let addresses = addr_to_symbol_mapping.iter().map(|a| *a.0 - 1).collect();
-        let symbols = symbolize_native_stack_blaze(addresses, path);
+        let symbols: Vec<String> = symbolize_native_stack_blaze(addresses, path);
         for (addr, symbol) in addr_to_symbol_mapping.clone().iter_mut().zip(symbols) {
             addr_to_symbol_mapping.insert(*addr.0, symbol.to_string());
         }
@@ -127,30 +139,28 @@ fn symbolize_profile(
     Ok(())
 }
 
-fn show_native_stack(
+fn symbolize_native_stack(
     addresses_per_sample: &mut HashMap<PathBuf, HashMap<u64, String>>,
     procs: &HashMap<i32, ProcessInfo>,
     objs: &HashMap<String, ObjectFileInfo>,
     task_id: i32,
     native_stack: &native_stack_t,
-) -> anyhow::Result<()> {
-    let p = procfs::process::Process::new(task_id)?;
-    let status = p.status()?;
-
-    let tgid = status.tgid;
-    println!("!! sample -- pid: {}, task_id: {}", tgid, p.pid());
+) -> Vec<String> {
+    let mut r = Vec::new();
 
     for (i, addr) in native_stack.addresses.into_iter().enumerate() {
         if native_stack.len <= i.try_into().unwrap() {
             break;
         }
 
-        let Some(info) = procs.get(&tgid) else {
-            return Err(anyhow!("process not found"));
+        let Some(info) = procs.get(&task_id) else {
+            return r;
+            //return Err(anyhow!("process not found"));
         };
 
         let Some(mapping) = find_mapping(&info.mappings, addr) else {
-            return Err(anyhow!("could not find mapping"));
+            return r;
+            //return Err(anyhow!("could not find mapping"));
         };
 
         // finally
@@ -161,22 +171,28 @@ fn show_native_stack(
                         - obj.elf_load.0
                         + obj.elf_load.1;
 
-                    let name = addresses_per_sample
-                        .get(&obj.path)
-                        .unwrap()
-                        .get(&normalized_addr);
-                    println!("\t\t - {:?}", name);
+                    let func_name = match addresses_per_sample.get(&obj.path) {
+                        Some(value) => match value.get(&normalized_addr) {
+                            Some(v) => v.to_string(),
+                            None => "<failed to fetch symbol for addr>".to_string(),
+                        },
+                        None => "<failed to symbolize>".to_string(),
+                    };
+                    //println!("\t\t - {:?}", name);
+                    r.push(func_name.to_string());
                 }
                 None => {
-                    println!("\t\t - [no build id found]");
+                    debug!("\t\t - [no build id found]");
                 }
             },
             None => {
-                println!("\t\t - mapping is not backed by a file, could be a JIT segment");
+                debug!("\t\t - mapping is not backed by a file, could be a JIT segment");
             }
         }
     }
-    Ok(())
+
+    r
+    // Ok(())
 }
 
 // Some temporary data structures to get things going, this could use lots of
@@ -307,12 +323,12 @@ pub struct Profiler<'bpf> {
     // Debug options
     filter_pids: HashMap<i32, bool>,
     // Profile channel
-    profile_send: Arc<Mutex<mpsc::Sender<RawProfile>>>,
-    profile_receive: Arc<Mutex<mpsc::Receiver<RawProfile>>>,
+    profile_send: Arc<Mutex<mpsc::Sender<RawAggregatedProfile>>>,
+    profile_receive: Arc<Mutex<mpsc::Receiver<RawAggregatedProfile>>>,
 }
 
 pub struct Collector {
-    profiles: Vec<RawProfile>,
+    profiles: Vec<RawAggregatedProfile>,
     procs: HashMap<i32, ProcessInfo>,
     objs: HashMap<String, ObjectFileInfo>,
 }
@@ -330,7 +346,7 @@ impl Collector {
 
     pub fn collect(
         &mut self,
-        profile: RawProfile,
+        profile: RawAggregatedProfile,
         procs: &HashMap<i32, ProcessInfo>,
         objs: &HashMap<String, ObjectFileInfo>,
     ) {
@@ -354,14 +370,15 @@ impl Collector {
         }
     }
 
-    pub fn finish(&self) {
+    pub fn finish(&self) -> Vec<SymbolizedAggregatedProfile> {
         let span: span::EnteredSpan = span!(Level::DEBUG, "symbolize_profiles").entered();
 
         debug!("Collector::finish {}", self.profiles.len());
-
+        let mut r = Vec::new();
         for profile in &self.profiles {
-            show_profile(profile, &self.procs, &self.objs);
+            r.push(symbolize_profile(profile, &self.procs, &self.objs));
         }
+        r
     }
 }
 
@@ -371,14 +388,23 @@ const MAX_UNWIND_INFO_SHARDS: u64 = 50;
 const SHARD_CAPACITY: usize = MAX_UNWIND_TABLE_SIZE as usize;
 const PERF_BUFFER_PAGES: usize = 512 * 1024;
 
-struct RawSample {
+struct RawAggregatedSample {
     pid: i32,
     ustack: Option<native_stack_t>,
     kstack: Option<native_stack_t>,
     count: u64,
 }
 
-type RawProfile = Vec<RawSample>;
+#[derive(Default, Debug)]
+pub struct SymbolizedAggregatedSample {
+    pid: i32,
+    pub ustack: Vec<String>,
+    kstack: Vec<String>,
+    pub count: u64,
+}
+
+pub type RawAggregatedProfile = Vec<RawAggregatedSample>;
+pub type SymbolizedAggregatedProfile = Vec<SymbolizedAggregatedSample>;
 
 impl Default for Profiler<'_> {
     fn default() -> Self {
@@ -442,7 +468,7 @@ impl Profiler<'_> {
         }
     }
 
-    pub fn send_profile(&mut self, profile: RawProfile) {
+    pub fn send_profile(&mut self, profile: RawAggregatedProfile) {
         self.profile_send
             .lock()
             .expect("sender lock")
@@ -488,20 +514,22 @@ impl Profiler<'_> {
             }
         });
 
-        let mut start = Instant::now();
+        let mut start_time: Instant = Instant::now();
+        let mut time_since_last_scheduled_collection: Instant = Instant::now();
 
         loop {
-            if start.elapsed() >= duration {
-                debug!("done after running for {:?}", start.elapsed());
+            if start_time.elapsed() >= duration {
+                debug!("done after running for {:?}", start_time.elapsed());
                 let profile = self.collect_profile();
                 self.send_profile(profile);
                 break;
             }
 
-            if start.elapsed() >= Duration::from_secs(5) {
+            if time_since_last_scheduled_collection.elapsed() >= Duration::from_secs(5) {
+                debug!("collecting profiles on schedule");
                 let profile = self.collect_profile();
                 self.send_profile(profile);
-                start = Instant::now();
+                time_since_last_scheduled_collection = Instant::now();
             }
 
             let read = self.chan_receive.lock().expect("receive lock").try_recv();
@@ -515,7 +543,7 @@ impl Profiler<'_> {
                         self.event_new_proc(pid);
 
                         //let mut pname = "<unknown>".to_string();
-/*                         if let Ok(proc) = procfs::process::Process::new(pid) {
+                        /*                         if let Ok(proc) = procfs::process::Process::new(pid) {
                             if let Ok(name) = proc.cmdline() {
                                 pname = name.join("").to_string();
                             }
@@ -539,7 +567,11 @@ impl Profiler<'_> {
         }
     }
 
-    pub fn collect_profile(&mut self) -> RawProfile {
+    pub fn clear_maps(&mut self) {
+        //   self.maps.aggregated_stacks()
+    }
+
+    pub fn collect_profile(&mut self) -> RawAggregatedProfile {
         debug!("collecting profile");
 
         self.teardown_perf_events();
@@ -570,8 +602,9 @@ impl Profiler<'_> {
                             Ok(Some(stack_bytes)) => {
                                 result_ustack = Some(*plain::from_bytes(&stack_bytes).unwrap());
                             }
-                            _ => {
-                                eprintln!("\tfailed getting user stack");
+                            Ok(None) => {}
+                            Err(e) => {
+                                error!("\tfailed getting user stack {}", e);
                             }
                         }
                     }
@@ -581,12 +614,12 @@ impl Profiler<'_> {
                                 result_kstack = Some(*plain::from_bytes(&stack_bytes).unwrap());
                             }
                             _ => {
-                                eprintln!("\tfailed getting kernel stack");
+                                error!("\tfailed getting kernel stack");
                             }
                         }
                     }
 
-                    let raw_sample = RawSample {
+                    let raw_sample = RawAggregatedSample {
                         pid: key.task_id,
                         ustack: result_ustack,
                         kstack: result_kstack,
@@ -607,6 +640,7 @@ impl Profiler<'_> {
             let _ = aggregated_stacks.delete(&stacks_bytes);
         }
 
+        self.clear_maps();
         self.setup_perf_events();
         result
     }
@@ -759,7 +793,13 @@ impl Profiler<'_> {
 
             // == Fetch unwind info, so far, this is in mem
             // todo, pass file handle
-            let span = span!(Level::DEBUG, "calling in_memory_unwind_info", "{}", first_mapping.path.to_string_lossy()).entered();
+            let span = span!(
+                Level::DEBUG,
+                "calling in_memory_unwind_info",
+                "{}",
+                first_mapping.path.to_string_lossy()
+            )
+            .entered();
 
             let Ok(mut found_unwind_info) =
                 in_memory_unwind_info(&first_mapping.path.to_string_lossy())
@@ -768,16 +808,14 @@ impl Profiler<'_> {
             };
             span.exit();
 
-
             let span: span::EnteredSpan = span!(Level::DEBUG, "unwind info sort").entered();
             found_unwind_info.sort_by(|a, b| {
                 let a_pc = a.pc;
                 let b_pc = b.pc;
                 a_pc.cmp(&b_pc)
             });
+
             span.exit();
-
-
 
             debug!(
                 "======== Unwind rows for executable {}: {} with id {}",
@@ -857,6 +895,7 @@ impl Profiler<'_> {
                         );
 
                         if current_chunk[0].cfa_type == CfaType::EndFdeMarker as u8 {
+                            // wrong start of unwind info 4
                             panic!("wrong start of unwind info {:?}", current_chunk[0].cfa_type);
                         }
                         if current_chunk[current_chunk.len() - 1].cfa_type

@@ -17,7 +17,7 @@ pub fn symbolize_native_stack_blaze(addrs: Vec<u64>, object_path: &PathBuf) -> V
     let symbolizer = Symbolizer::new();
     let syms = symbolizer
         .symbolize(&src, Input::VirtOffset(&addrs))
-        .unwrap();
+        .unwrap(); // <----
 
     for sym in syms.iter() {
         match sym {
