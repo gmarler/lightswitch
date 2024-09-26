@@ -25,27 +25,27 @@ may need some attention:
     1. Run lightswitch with `--bpf-logging option`, so the unwinder will log
     2. In a separate shell, run `bpftool prog tracelog` and grep for the binary
        name (in this case, rq_handler), to get output like:
-```
-      rq_handler-66913 [014] d.h. 59967.290608: bpf_trace_printk: target f1a0 left 68655 right 69300
-      rq_handler-66913 [014] d.h. 59967.290609: bpf_trace_printk:       .done
-      rq_handler-66913 [014] d.h. 59967.290609: bpf_trace_printk:       => table_index: 69211
-      rq_handler-66913 [014] d.h. 59967.290609: bpf_trace_printk:       => object relative pc: 95f1a0
-      rq_handler-66913 [014] d.h. 59967.290610: bpf_trace_printk:       cfa type: 1, offset: 16 (row pc: 95f15d)
-      rq_handler-66913 [014] d.h. 59967.290610: bpf_trace_printk:       (bp_offset: -16, bp value stored at 7ecc0101a550)
-      rq_handler-66913 [014] d.h. 59967.290611: bpf_trace_printk:       previous ip: 8f4193 (@ 7ecc0101a558)
-      rq_handler-66913 [014] d.h. 59967.290611: bpf_trace_printk:       previous sp: 7ecc0101a560
-      rq_handler-66913 [014] d.h. 59967.290611: bpf_trace_printk:       previous bp: 7ecc0101ad10
-      rq_handler-66913 [014] d.h. 59967.290612: bpf_trace_printk: ## frame: 2
-      rq_handler-66913 [014] d.h. 59967.290614: bpf_trace_printk:       current pc: 8f4193
-      rq_handler-66913 [014] d.h. 59967.290615: bpf_trace_printk:       current sp: 7ecc0101a560
-      rq_handler-66913 [014] d.h. 59967.290616: bpf_trace_printk:       current bp: 7ecc0101ad10
-      rq_handler-66913 [014] d.h. 59967.290617: bpf_trace_printk: target 4193 left 65467 right 66003
-      rq_handler-66913 [014] d.h. 59967.290619: bpf_trace_printk:       .done
-      rq_handler-66913 [014] d.h. 59967.290620: bpf_trace_printk:       => table_index: 65515
-      rq_handler-66913 [014] d.h. 59967.290621: bpf_trace_printk:       => object relative pc: 8f4193
-      rq_handler-66913 [014] d.h. 59967.290623: bpf_trace_printk:       cfa type: 3, offset: 0 (row pc: 8f397b)
-      rq_handler-66913 [014] d.h. 59967.290623: bpf_trace_printk:       [error] frame pointer is 3 (register or exp), bailing out
-```
+       ```
+       rq_handler-66913 [014] d.h. 59967.290608: bpf_trace_printk: target f1a0 left 68655 right 69300
+       rq_handler-66913 [014] d.h. 59967.290609: bpf_trace_printk:       .done
+       rq_handler-66913 [014] d.h. 59967.290609: bpf_trace_printk:       => table_index: 69211
+       rq_handler-66913 [014] d.h. 59967.290609: bpf_trace_printk:       => object relative pc: 95f1a0
+       rq_handler-66913 [014] d.h. 59967.290610: bpf_trace_printk:       cfa type: 1, offset: 16 (row pc: 95f15d)
+       rq_handler-66913 [014] d.h. 59967.290610: bpf_trace_printk:       (bp_offset: -16, bp value stored at 7ecc0101a550)
+       rq_handler-66913 [014] d.h. 59967.290611: bpf_trace_printk:       previous ip: 8f4193 (@ 7ecc0101a558)
+       rq_handler-66913 [014] d.h. 59967.290611: bpf_trace_printk:       previous sp: 7ecc0101a560
+       rq_handler-66913 [014] d.h. 59967.290611: bpf_trace_printk:       previous bp: 7ecc0101ad10
+       rq_handler-66913 [014] d.h. 59967.290612: bpf_trace_printk: ## frame: 2
+       rq_handler-66913 [014] d.h. 59967.290614: bpf_trace_printk:       current pc: 8f4193
+       rq_handler-66913 [014] d.h. 59967.290615: bpf_trace_printk:       current sp: 7ecc0101a560
+       rq_handler-66913 [014] d.h. 59967.290616: bpf_trace_printk:       current bp: 7ecc0101ad10
+       rq_handler-66913 [014] d.h. 59967.290617: bpf_trace_printk: target 4193 left 65467 right 66003
+       rq_handler-66913 [014] d.h. 59967.290619: bpf_trace_printk:       .done
+       rq_handler-66913 [014] d.h. 59967.290620: bpf_trace_printk:       => table_index: 65515
+       rq_handler-66913 [014] d.h. 59967.290621: bpf_trace_printk:       => object relative pc: 8f4193
+       rq_handler-66913 [014] d.h. 59967.290623: bpf_trace_printk:       cfa type: 3, offset: 0 (row pc: 8f397b)
+       rq_handler-66913 [014] d.h. 59967.290623: bpf_trace_printk:       [error] frame pointer is 3 (register or exp), bailing out
+       ```
     3. Check to see what the interpreted CFA for this process at the rip
        (row pc) mentioned at 0x8f397b for the rq_handler binary:
        ```
