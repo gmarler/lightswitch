@@ -941,12 +941,16 @@ impl Profiler {
 
     pub fn handle_process_exit(&mut self, pid: Pid, partial_write: bool) {
         // TODO: remove ratelimits for this process.
+        // TODO: This handler can be called before we've had a chance to register the pid in the
+        //       first place, so we should just put the PID in the deletion_scheduler, and do any
+        //       work after a couple of sessions have elapsed.
         let mut procs = self.procs.write();
         match procs.get_mut(&pid) {
             Some(proc_info) => {
                 debug!("marking process {} as exited", pid);
                 proc_info.status = ProcessStatus::Exited;
 
+                // NOTE: This is the only thing we should probably do in this handler
                 self.deletion_scheduler
                     .write()
                     .add(ToDelete::Process(Instant::now(), pid));
@@ -975,9 +979,9 @@ impl Profiler {
                     }
                 }
             }
-            None => {
-                debug!("could not find process {} while marking as exited", pid);
-            }
+            // This is normal, as the process might have exited before we got around to registering
+            // that we know about it.
+            None => (),
         }
     }
 
