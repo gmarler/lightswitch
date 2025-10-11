@@ -845,9 +845,37 @@ impl Profiler {
                         for pid in pending_deletion {
                             match procs.remove(&pid) {
                                 // TODO: Do more here with exec_mappings and object_files
-                                Some(_proc_info) => (),
+                                Some(proc_info) => {
+                                    debug!("marking process {} as exited", pid);
+                                    proc_info.status = ProcessStatus::Exited;
+
+                                    let err = Self::delete_bpf_process(&self.native_unwinder, pid);
+                                    if let Err(e) = err {
+                                        debug!("could not remove bpf process due to {:?}", e);
+                                    }
+
+                                    for mapping in &mut proc_info.mappings.0 {
+                                        let mut object_files = self.object_files.write();
+                                        if mapping.mark_as_deleted(&mut object_files) {
+                                            if let Entry::Occupied(entry) = self
+                                                .native_unwind_state
+                                                .known_executables
+                                                .entry(mapping.executable_id)
+                                            {
+                                                Self::delete_bpf_native_unwind_all(
+                                                    pid,
+                                                    &mut self.native_unwinder,
+                                                    mapping,
+                                                    entry,
+                                                    partial_write,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 // Short lived processes may never have been registered - we just
-                                // ignore or debug log the fact that they exit()ed
+                                // ignore or debug log the fact that they exit()ed without needing
+                                // to be handled
                                 None => {
                                     debug!("PID {} was never detected - ignoring", pid);
                                 },
@@ -944,45 +972,9 @@ impl Profiler {
         // TODO: This handler can be called before we've had a chance to register the pid in the
         //       first place, so we should just put the PID in the deletion_scheduler, and do any
         //       work after a couple of sessions have elapsed.
-        let mut procs = self.procs.write();
-        match procs.get_mut(&pid) {
-            Some(proc_info) => {
-                debug!("marking process {} as exited", pid);
-                proc_info.status = ProcessStatus::Exited;
-
-                // NOTE: This is the only thing we should probably do in this handler
-                self.deletion_scheduler
-                    .write()
-                    .add(ToDelete::Process(Instant::now(), pid));
-
-                let err = Self::delete_bpf_process(&self.native_unwinder, pid);
-                if let Err(e) = err {
-                    debug!("could not remove bpf process due to {:?}", e);
-                }
-
-                for mapping in &mut proc_info.mappings.0 {
-                    let mut object_files = self.object_files.write();
-                    if mapping.mark_as_deleted(&mut object_files) {
-                        if let Entry::Occupied(entry) = self
-                            .native_unwind_state
-                            .known_executables
-                            .entry(mapping.executable_id)
-                        {
-                            Self::delete_bpf_native_unwind_all(
-                                pid,
-                                &mut self.native_unwinder,
-                                mapping,
-                                entry,
-                                partial_write,
-                            );
-                        }
-                    }
-                }
-            }
-            // This is normal, as the process might have exited before we got around to registering
-            // that we know about it.
-            None => (),
-        }
+        self.deletion_scheduler
+            .write()
+            .add(ToDelete::Process(Instant::now(), pid));
     }
 
     pub fn handle_munmap(&mut self, pid: Pid, start_address: u64) {
