@@ -1,99 +1,92 @@
-#include "tracers.h"
-#include "profiler.h"
-#include "shared_helpers.h"
-#include "shared_maps.h"
 #include "vmlinux.h"
+#include "profiler.h"
+#include "shared_maps.h"
+#include "shared_helpers.h"
+#include "tracers.h"
 
-#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 
 typedef struct {
-  u64 pid_tgid;
+    u64 pid_tgid;
 } mmap_data_key_t;
 
 struct {
-  __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-  __uint(key_size, sizeof(u32));
-  __uint(value_size, sizeof(u32));
-  __uint(max_entries, 0);
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(u32));
+    __uint(value_size, sizeof(u32));
+    __uint(max_entries, 0);
 } tracer_events SEC(".maps");
 
 struct {
-  __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 256 * 1024 /* 256 KB */);
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024 /* 256 KB */);
 } tracer_events_rb SEC(".maps");
 
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 500);
-  __type(key, mmap_data_key_t);
-  __type(value, u64);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 500);
+    __type(key, mmap_data_key_t);
+    __type(value, u64);
 } tracked_munmap SEC(".maps");
 
 // Arguments from
 // /sys/kernel/debug/tracing/events/syscalls/sys_enter_munmap/format
 struct munmap_entry_args {
-  unsigned short common_type;
-  unsigned char common_flags;
-  unsigned char common_preempt_count;
-  int common_pid;
-  int __syscall_nr;
-  unsigned long addr;
-  size_t len;
+    unsigned short common_type;
+    unsigned char common_flags;
+    unsigned char common_preempt_count;
+    int common_pid;
+    int __syscall_nr;
+    unsigned long addr;
+    size_t len;
 };
 
 SEC("tracepoint/sched/sched_process_exit")
 int tracer_process_exit(void *ctx) {
-  struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
-  unsigned int level = BPF_CORE_READ(task, nsproxy, pid_ns_for_children, level);
-  int per_process_id =
-      BPF_CORE_READ(task, group_leader, thread_pid, numbers[level].nr);
-  int per_thread_id = BPF_CORE_READ(task, thread_pid, numbers[level].nr);
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    unsigned int level = BPF_CORE_READ(task, nsproxy, pid_ns_for_children, level);
+    int per_process_id = BPF_CORE_READ(task, group_leader, thread_pid, numbers[level].nr);
+    int per_thread_id = BPF_CORE_READ(task, thread_pid, numbers[level].nr);
 
-  // To avoid a race condition with detecting and registering a PID *before*
-  // it's exit tracepoint has fired, we just ignore whether we know about this
-  // PID or not if (!process_is_known(per_process_id)) {
-  //     return 0;
-  // }
+    if (!process_is_known(per_process_id)) {
+        return 0;
+    }
 
-  // Only report main thread terminating.
-  if (per_process_id != per_thread_id) {
+    // Only report main thread terminating.
+    if (per_process_id != per_thread_id) {
+        return 0;
+    }
+
+    tracer_event_t event = {
+        .type = TRACER_EVENT_TYPE_PROCESS_EXIT,
+        .pid = bpf_get_current_pid_tgid() >> 32,
+        .start_address = 0,
+    };
+
+    int ret = 0;
+    if (lightswitch_config.use_ring_buffers) {
+        ret = bpf_ringbuf_output(&tracer_events_rb, &event, sizeof(tracer_event_t), 0);
+    } else {
+        ret = bpf_perf_event_output(ctx, &tracer_events, BPF_F_CURRENT_CPU, &event, sizeof(tracer_event_t));
+    }
+    if (ret < 0) {
+        LOG("[error] failed to send process exit tracer event");
+        return 0;
+    }
+
+    LOG("[debug] sent process exit tracer event");
     return 0;
-  }
-
-  tracer_event_t event = {
-      .type = TRACER_EVENT_TYPE_PROCESS_EXIT,
-      .pid = bpf_get_current_pid_tgid() >> 32,
-      .start_address = 0,
-  };
-
-  int ret = 0;
-  if (lightswitch_config.use_ring_buffers) {
-    ret = bpf_ringbuf_output(&tracer_events_rb, &event, sizeof(tracer_event_t),
-                             0);
-  } else {
-    ret = bpf_perf_event_output(ctx, &tracer_events, BPF_F_CURRENT_CPU, &event,
-                                sizeof(tracer_event_t));
-  }
-  if (ret < 0) {
-    LOG("[error] failed to send process exit tracer event");
-    return 0;
-  }
-
-  LOG("[debug] sent process exit tracer event");
-  return 0;
 }
 
 // SEC("tracepoint/syscalls/sys_enter_munmap")
 // int tracer_enter_munmap(struct munmap_entry_args *args) {
 //     u64 start_address = args->addr;
-//     struct task_struct *task = (struct task_struct
-//     *)bpf_get_current_task_btf(); unsigned int level = BPF_CORE_READ(task,
-//     nsproxy, pid_ns_for_children, level); int per_process_id =
-//     BPF_CORE_READ(task, group_leader, thread_pid, numbers[level].nr);
+//     struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+//     unsigned int level = BPF_CORE_READ(task, nsproxy, pid_ns_for_children, level);
+//     int per_process_id = BPF_CORE_READ(task, group_leader, thread_pid, numbers[level].nr);
 //
-//     // We might not know about some mappings, but also we definitely don't
-//     want to notify
+//     // We might not know about some mappings, but also we definitely don't want to notify
 //     // of non-executable mappings being unmapped.
 //     mapping_t *mapping = find_mapping(per_process_id, start_address);
 //     if (mapping == NULL){
@@ -138,11 +131,9 @@ int tracer_process_exit(void *ctx) {
 //     };
 //
 //     if (lightswitch_config.use_ring_buffers) {
-//         ret = bpf_ringbuf_output(&tracer_events_rb, &event,
-//         sizeof(tracer_event_t), 0);
+//         ret = bpf_ringbuf_output(&tracer_events_rb, &event, sizeof(tracer_event_t), 0);
 //     } else {
-//         ret = bpf_perf_event_output(ctx, &tracer_events, BPF_F_CURRENT_CPU,
-//         &event, sizeof(tracer_event_t));
+//         ret = bpf_perf_event_output(ctx, &tracer_events, BPF_F_CURRENT_CPU, &event, sizeof(tracer_event_t));
 //     }
 //     if (ret < 0) {
 //         LOG("[error] failed to send munmap tracer event");

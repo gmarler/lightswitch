@@ -834,9 +834,6 @@ impl Profiler {
                     // here
                     let procs_to_reap = pending_deletion.len();
                     if procs_to_reap > 0 {
-                        // TODO: All process exit()s are handled, whether we detected them or not.
-                        //       Change this to note which PIDs we were actually tracking and
-                        //       delete
                         let pids_to_del_str = pending_deletion.iter().map(|&n| n.to_string())
                             .collect::<Vec<String>>()
                             .join(", ");
@@ -846,10 +843,8 @@ impl Profiler {
                             match procs.remove(&pid) {
                                 // TODO: Do more here with exec_mappings and object_files
                                 Some(_proc_info) => (),
-                                // Short lived processes may never have been registered - we just
-                                // ignore or debug log the fact that they exit()ed
                                 None => {
-                                    debug!("PID {} was never detected - ignoring", pid);
+                                    debug!("could not find process {} that we're trying to delete procs entry for", pid);
                                 },
                             }
                         }
