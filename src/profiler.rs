@@ -845,7 +845,8 @@ impl Profiler {
                         let pids_to_del_str = pending_deletion.iter().map(|(n, _)| n.to_string())
                             .collect::<Vec<String>>()
                             .join(", ");
-                        debug!("Final deletion of {} exited processes: {}", procs_to_reap, pids_to_del_str);
+                        debug!("Final deletion of {} exited processes we were actually tracking: {}",
+                            pending_deletion.len(), pids_to_del_str);
                         // promote to a write lock
                         std::mem::drop(procs);
                         let mut procs = self.procs.write();
@@ -856,6 +857,8 @@ impl Profiler {
                                     debug!("marking process {} as exited", pid);
                                     proc_info.status = ProcessStatus::Exited;
 
+                                    // TODO: If this was a partial_write, we probably shouldn't try
+                                    //       this
                                     let err = Self::delete_bpf_process(&self.native_unwinder, pid);
                                     if let Err(e) = err {
                                         debug!("could not remove bpf process due to {:?}", e);
