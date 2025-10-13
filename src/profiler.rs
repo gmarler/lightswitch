@@ -818,14 +818,14 @@ impl Profiler {
                     self.send_profile(profile);
                     // Pop off any processes that we've kept around long enough after they exited
                     // TODO: Do this in a separate thread?
-                    let mut pending_deletion: Vec<Pid> = vec![];
+                    let mut pending_deletion: Vec<(Pid,bool)> = vec![];
                     loop {
                         let to_delete_vec = self.deletion_scheduler.write().pop_pending();
                         if ! to_delete_vec.is_empty() {
-                            let pid = match to_delete_vec[0] {
-                                ToDelete::Process(_, pid) => pid,
+                            let (pid, partial_write) = match to_delete_vec[0] {
+                                ToDelete::Process(_, pid, partial_write) => (pid, partial_write),
                             };
-                            pending_deletion.push(pid);
+                            pending_deletion.push((pid,partial_write));
                         } else { break; }
                     }
 
@@ -837,15 +837,22 @@ impl Profiler {
                         // TODO: All process exit()s are handled, whether we detected them or not.
                         //       Change this to note which PIDs we were actually tracking and
                         //       delete
-                        let pids_to_del_str = pending_deletion.iter().map(|&n| n.to_string())
+                        // 1st pass - eliminate any exited PIDs we never got samples from
+                        debug!("First pass of pending_deletions had {} exited processes", procs_to_reap);
+                        let procs = self.procs.read();  // read lock to start
+                        pending_deletion.retain(|(pid, _)| procs.contains_key(pid));
+                        // 2nd pass - Perform the actual final deletions
+                        let pids_to_del_str = pending_deletion.iter().map(|(n, _)| n.to_string())
                             .collect::<Vec<String>>()
                             .join(", ");
                         debug!("Final deletion of {} exited processes: {}", procs_to_reap, pids_to_del_str);
+                        // promote to a write lock
+                        std::mem::drop(procs);
                         let mut procs = self.procs.write();
-                        for pid in pending_deletion {
+                        for (pid, partial_write) in pending_deletion {
                             match procs.remove(&pid) {
                                 // TODO: Do more here with exec_mappings and object_files
-                                Some(proc_info) => {
+                                Some(mut proc_info) => {
                                     debug!("marking process {} as exited", pid);
                                     proc_info.status = ProcessStatus::Exited;
 
@@ -969,12 +976,12 @@ impl Profiler {
 
     pub fn handle_process_exit(&mut self, pid: Pid, partial_write: bool) {
         // TODO: remove ratelimits for this process.
-        // TODO: This handler can be called before we've had a chance to register the pid in the
-        //       first place, so we should just put the PID in the deletion_scheduler, and do any
-        //       work after a couple of sessions have elapsed.
+        // This handler can be called before we've had a chance to register the pid in the
+        // first place, so we should just put the PID in the deletion_scheduler, and do any
+        // work after a couple of sessions have elapsed.
         self.deletion_scheduler
             .write()
-            .add(ToDelete::Process(Instant::now(), pid));
+            .add(ToDelete::Process(Instant::now(), pid, partial_write));
     }
 
     pub fn handle_munmap(&mut self, pid: Pid, start_address: u64) {

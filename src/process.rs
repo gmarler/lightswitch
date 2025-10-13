@@ -189,7 +189,7 @@ impl DeletionScheduler {
         let mut r = Vec::new();
 
         match self.peek() {
-            Some(ToDelete::Process(time, _)) => {
+            Some(ToDelete::Process(time, _, _)) => {
                 if time.elapsed() > self.pending_after {
                     r.push(self.pop().unwrap())
                 }
@@ -203,7 +203,8 @@ impl DeletionScheduler {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum ToDelete {
-    Process(Instant, Pid),
+    // The bool is whether the deletion is of a partial_write or not
+    Process(Instant, Pid, bool),
 }
 
 impl PartialOrd for ToDelete {
@@ -215,10 +216,10 @@ impl PartialOrd for ToDelete {
 impl Ord for ToDelete {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let a = match self {
-            ToDelete::Process(time, _) => time,
+            ToDelete::Process(time, _, _) => time,
         };
         let b = match other {
-            ToDelete::Process(time, _) => time,
+            ToDelete::Process(time, _, _) => time,
         };
         // We want a reversed comparison - the older it is, the more we want it
         b.cmp(a)
@@ -226,8 +227,8 @@ impl Ord for ToDelete {
 }
 
 impl ToDelete {
-    pub fn from_pid(pid: Pid, when: Option<Instant>) -> Self {
-        Self::Process(when.unwrap_or(Instant::now()), pid)
+    pub fn from_pid(pid: Pid, when: Option<Instant>, partial_write: bool) -> Self {
+        Self::Process(when.unwrap_or(Instant::now()), pid, partial_write)
     }
 }
 
@@ -239,34 +240,82 @@ mod tests {
     fn test_schedule_deletion() {
         let mut d = DeletionScheduler::new(Duration::from_secs(5));
         let base_time = Instant::now();
-        d.add(ToDelete::Process(base_time + Duration::from_secs(0), 314));
-        d.add(ToDelete::Process(base_time + Duration::from_secs(100), 482));
-        d.add(ToDelete::Process(base_time + Duration::from_secs(200), 572));
+        d.add(ToDelete::Process(
+            base_time + Duration::from_secs(0),
+            314,
+            true,
+        ));
+        d.add(ToDelete::Process(
+            base_time + Duration::from_secs(100),
+            482,
+            true,
+        ));
+        d.add(ToDelete::Process(
+            base_time + Duration::from_secs(200),
+            572,
+            true,
+        ));
 
-        assert!(matches!(d.pop(), Some(ToDelete::Process(_, 314))));
-        assert!(matches!(d.pop(), Some(ToDelete::Process(_, 482))));
-        assert!(matches!(d.pop(), Some(ToDelete::Process(_, 572))));
+        assert!(matches!(d.pop(), Some(ToDelete::Process(_, 314, true))));
+        assert!(matches!(d.pop(), Some(ToDelete::Process(_, 482, true))));
+        assert!(matches!(d.pop(), Some(ToDelete::Process(_, 572, true))));
 
         assert_eq!(d.pop_pending().len(), 0);
 
-        d.add(ToDelete::Process(base_time - Duration::from_secs(4), 4));
-        d.add(ToDelete::Process(base_time - Duration::from_secs(0), 0));
-        d.add(ToDelete::Process(base_time - Duration::from_secs(6), 6));
-        d.add(ToDelete::Process(base_time - Duration::from_secs(20), 20));
-        d.add(ToDelete::Process(base_time - Duration::from_secs(5), 5));
-        d.add(ToDelete::Process(base_time - Duration::from_secs(1), 1));
+        d.add(ToDelete::Process(
+            base_time - Duration::from_secs(4),
+            4,
+            true,
+        ));
+        d.add(ToDelete::Process(
+            base_time - Duration::from_secs(0),
+            0,
+            true,
+        ));
+        d.add(ToDelete::Process(
+            base_time - Duration::from_secs(6),
+            6,
+            true,
+        ));
+        d.add(ToDelete::Process(
+            base_time - Duration::from_secs(20),
+            20,
+            true,
+        ));
+        d.add(ToDelete::Process(
+            base_time - Duration::from_secs(5),
+            5,
+            true,
+        ));
+        d.add(ToDelete::Process(
+            base_time - Duration::from_secs(1),
+            1,
+            true,
+        ));
 
         assert_eq!(
             d.pop_pending(),
-            vec![ToDelete::Process(base_time - Duration::from_secs(20), 20)]
+            vec![ToDelete::Process(
+                base_time - Duration::from_secs(20),
+                20,
+                true
+            )]
         );
         assert_eq!(
             d.pop_pending(),
-            vec![ToDelete::Process(base_time - Duration::from_secs(6), 6)]
+            vec![ToDelete::Process(
+                base_time - Duration::from_secs(6),
+                6,
+                true
+            )]
         );
         assert_eq!(
             d.pop_pending(),
-            vec![ToDelete::Process(base_time - Duration::from_secs(5), 5)]
+            vec![ToDelete::Process(
+                base_time - Duration::from_secs(5),
+                5,
+                true
+            )]
         );
         assert_eq!(d.pop_pending(), vec![]);
     }
