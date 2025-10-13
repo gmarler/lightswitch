@@ -2321,19 +2321,19 @@ mod tests {
                 > 2
         );
         profiler.handle_process_exit(std::process::id() as i32, false);
-        assert_eq!(profiler.native_unwinder.maps.outer_map.keys().count(), 0);
-        assert_eq!(
-            profiler.native_unwinder.maps.exec_mappings.keys().count(),
-            0
-        );
-        assert_eq!(
+        assert!(profiler.native_unwinder.maps.outer_map.keys().count() > 0);
+        assert!(profiler.native_unwinder.maps.exec_mappings.keys().count() > 0);
+        // It's been marked as Exited, but hasn't been removed yet
+        assert!(profiler.procs.read().keys().count() == 1);
+        assert!(profiler.procs.read().values().next().unwrap().status == ProcessStatus::Exited);
+        assert!(
             profiler
                 .native_unwinder
                 .maps
                 .executable_to_page
                 .keys()
-                .count(),
-            0
+                .count()
+                > 0
         );
     }
 }
