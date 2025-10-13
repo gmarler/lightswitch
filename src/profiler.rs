@@ -834,9 +834,9 @@ impl Profiler {
                     // here
                     let procs_to_reap = pending_deletion.len();
                     if procs_to_reap > 0 {
-                        // TODO: All process exit()s are handled, whether we detected them or not.
-                        //       Change this to note which PIDs we were actually tracking and
-                        //       delete
+                        // All process exit()s are handled, whether we detected their existence or not.
+                        // We note which PIDs we're actually tracking and ignore the rest
+                        //
                         // 1st pass - eliminate any exited PIDs we never got samples from
                         debug!("First pass of pending_deletions had {} exited processes", procs_to_reap);
                         let procs = self.procs.read();  // read lock to start
@@ -854,9 +854,8 @@ impl Profiler {
                             match procs.remove(&pid) {
                                 // TODO: Do more here with exec_mappings and object_files
                                 Some(mut proc_info) => {
-
                                     // TODO: If this was a partial_write, we probably shouldn't try
-                                    //       this
+                                    //       delete_bpf_process
                                     let err = Self::delete_bpf_process(&self.native_unwinder, pid);
                                     if let Err(e) = err {
                                         debug!("could not remove bpf process due to {:?}", e);
@@ -981,6 +980,7 @@ impl Profiler {
                 .info
                 .max_entries
         );
+        info!("object_files count: {}", self.object_files.read().len());
         // Reset per session metrics
         self.new_proc_per_session = 0;
         self.exit_proc_per_session = 0;
