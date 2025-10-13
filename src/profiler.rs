@@ -854,6 +854,7 @@ impl Profiler {
                             match procs.remove(&pid) {
                                 // TODO: Do more here with exec_mappings and object_files
                                 Some(mut proc_info) => {
+                                    // TODO: These two lines should be done in handle_process_exit
                                     debug!("marking process {} as exited", pid);
                                     proc_info.status = ProcessStatus::Exited;
 
@@ -956,21 +957,32 @@ impl Profiler {
         }
         std::mem::drop(procs_guard);
         let live_pid_count = self.live_pid_count();
-        debug!(
+        info!(
             "{} processes tracked, {} actually live",
             running_procs, live_pid_count
         );
-        debug!(
+        info!(
             "{} Processes have exited and are awaiting FINAL DELETION",
             exited_procs
         );
-        debug!(
+        info!(
             "{} new processes this session, {} new processes since profiler startup",
             self.new_proc_per_session, self.new_proc_total
         );
-        debug!(
+        info!(
             "{} process exits this session; {} process exits since profiler startup",
             self.exit_proc_per_session, self.exit_proc_total
+        );
+        info!(
+            "exec_mappings usage: {}/{}",
+            self.native_unwinder.maps.exec_mappings.keys().count(),
+            self.native_unwinder
+                .maps
+                .exec_mappings
+                .info()
+                .unwrap()
+                .info
+                .max_entries
         );
         // Reset per session metrics
         self.new_proc_per_session = 0;
