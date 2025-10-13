@@ -854,9 +854,6 @@ impl Profiler {
                             match procs.remove(&pid) {
                                 // TODO: Do more here with exec_mappings and object_files
                                 Some(mut proc_info) => {
-                                    // TODO: These two lines should be done in handle_process_exit
-                                    debug!("marking process {} as exited", pid);
-                                    proc_info.status = ProcessStatus::Exited;
 
                                     // TODO: If this was a partial_write, we probably shouldn't try
                                     //       this
@@ -997,6 +994,16 @@ impl Profiler {
         self.deletion_scheduler
             .write()
             .add(ToDelete::Process(Instant::now(), pid, partial_write));
+        // If we know about this PID, mark it as having exited.  If it lived a short enough time
+        // that we didn't start tracking it's exit is being handled, it won't matter
+        let mut procs = self.procs.write();
+        match procs.get_mut(&pid) {
+            Some(proc_info) => {
+                debug!("marking process {} as exited", pid);
+                proc_info.status = ProcessStatus::Exited;
+            }
+            None => (), // Nothing to do
+        }
     }
 
     pub fn handle_munmap(&mut self, pid: Pid, start_address: u64) {
