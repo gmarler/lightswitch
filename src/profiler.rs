@@ -854,13 +854,7 @@ impl Profiler {
                             match procs.remove(&pid) {
                                 // TODO: Do more here with exec_mappings and object_files
                                 Some(mut proc_info) => {
-                                    // TODO: If this was a partial_write, we probably shouldn't try
-                                    //       delete_bpf_process
-                                    let err = Self::delete_bpf_process(&self.native_unwinder, pid);
-                                    if let Err(e) = err {
-                                        debug!("could not remove bpf process due to {:?}", e);
-                                    }
-
+                                    // Start by cleaning up all of the process mappings
                                     for mapping in &mut proc_info.mappings.0 {
                                         let mut object_files = self.object_files.write();
                                         if mapping.mark_as_deleted(&mut object_files) {
@@ -878,6 +872,12 @@ impl Profiler {
                                                 );
                                             }
                                         }
+                                    }
+
+                                    // Now complete the job by cleaning up the process itself
+                                    let err = Self::delete_bpf_process(&self.native_unwinder, pid);
+                                    if let Err(e) = err {
+                                        warn!("could not remove bpf process due to {:?}", e);
                                     }
                                 }
                                 // Short lived processes may never have been registered - we just
