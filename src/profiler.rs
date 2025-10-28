@@ -834,6 +834,8 @@ impl Profiler {
                     // here
                     let procs_to_reap = pending_deletion.len();
                     if procs_to_reap > 0 {
+                        // Metrics we track for deletions
+                        let mut failed_bpf_delete_process = HashMap::new();
                         // All process exit()s are handled, whether we detected their existence or not.
                         // We note which PIDs we're actually tracking and ignore the rest
                         //
@@ -877,7 +879,7 @@ impl Profiler {
                                     // Now complete the job by cleaning up the process itself
                                     let err = Self::delete_bpf_process(&self.native_unwinder, pid);
                                     if let Err(e) = err {
-                                        warn!("could not remove bpf process due to {:?}", e);
+                                        failed_bpf_delete_process.entry(e.to_string()).and_modify(|events| *events += 1).or_insert(0);
                                     }
                                 }
                                 // Short lived processes may never have been registered - we just
@@ -886,6 +888,13 @@ impl Profiler {
                                 None => {
                                     debug!("PID {} was never detected - ignoring", pid);
                                 },
+                            }
+                        }
+                        // Print out info on deletion issues
+                        if !failed_bpf_delete_process.is_empty() {
+                            info!("bpf_delete_process() failures due to:");
+                            for (failure, count) in failed_bpf_delete_process.into_iter() {
+                                info!("bpf_delete_process() failed with err {} {} times",failure, count);
                             }
                         }
                         // TODO: Make sure whether we need the following
