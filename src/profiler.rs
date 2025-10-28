@@ -879,7 +879,10 @@ impl Profiler {
                                     // Now complete the job by cleaning up the process itself
                                     let err = Self::delete_bpf_process(&self.native_unwinder, pid);
                                     if let Err(e) = err {
-                                        failed_bpf_delete_process.entry(e.to_string()).and_modify(|events| *events += 1).or_insert(0);
+                                        failed_bpf_delete_process
+                                            .entry(e.to_string())
+                                            .and_modify(|events| *events += 1)
+                                            .or_insert(0);
                                     }
                                 }
                                 // Short lived processes may never have been registered - we just
@@ -894,7 +897,7 @@ impl Profiler {
                         if !failed_bpf_delete_process.is_empty() {
                             info!("bpf_delete_process() failures due to:");
                             for (failure, count) in failed_bpf_delete_process.into_iter() {
-                                info!("bpf_delete_process() failed with err {} {} times",failure, count);
+                                info!("bpf_delete_process() failed with err [{}] {} times",failure, count);
                             }
                         }
                         // TODO: Make sure whether we need the following
