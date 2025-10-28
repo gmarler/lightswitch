@@ -895,7 +895,6 @@ impl Profiler {
                         }
                         // Print out info on deletion issues
                         if !failed_bpf_delete_process.is_empty() {
-                            info!("bpf_delete_process() failures due to:");
                             for (failure, count) in failed_bpf_delete_process.into_iter() {
                                 info!("bpf_delete_process() failed with err [{}] {} times",failure, count);
                             }
