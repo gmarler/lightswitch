@@ -835,6 +835,7 @@ impl Profiler {
                     let procs_to_reap = pending_deletion.len();
                     if procs_to_reap > 0 {
                         // Metrics we track for deletions
+                        let mut attempted_bpf_delete_process = 0;
                         let mut failed_bpf_delete_process = HashMap::new();
                         // All process exit()s are handled, whether we detected their existence or not.
                         // We note which PIDs we're actually tracking and ignore the rest
@@ -878,6 +879,7 @@ impl Profiler {
 
                                     // Now complete the job by cleaning up the process itself
                                     let err = Self::delete_bpf_process(&self.native_unwinder, pid);
+                                    attempted_bpf_delete_process += 1;
                                     if let Err(e) = err {
                                         failed_bpf_delete_process
                                             .entry(e.to_string())
@@ -896,7 +898,8 @@ impl Profiler {
                         // Print out info on deletion issues
                         if !failed_bpf_delete_process.is_empty() {
                             for (failure, count) in failed_bpf_delete_process.into_iter() {
-                                info!("bpf_delete_process() failed with err [{}] {} times",failure, count);
+                                info!("bpf_delete_process() attempted {} times, failed with err [{}] {} times",
+                                    attempted_bpf_delete_process, failure, count);
                             }
                         }
                         // TODO: Make sure whether we need the following
