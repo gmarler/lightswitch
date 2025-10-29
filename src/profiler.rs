@@ -884,7 +884,7 @@ impl Profiler {
                                         failed_bpf_delete_process
                                             .entry(e.to_string())
                                             .and_modify(|events| *events += 1)
-                                            .or_insert(0);
+                                            .or_insert(1);
                                     }
                                 }
                                 // Short lived processes may never have been registered - we just
