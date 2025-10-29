@@ -968,7 +968,7 @@ impl Profiler {
         std::mem::drop(procs_guard);
         let live_pid_count = self.live_pid_count();
         info!(
-            "{} processes tracked, {} actually live",
+            "{} processes being tracked, {} total processes running",
             running_procs, live_pid_count
         );
         info!(
@@ -976,7 +976,7 @@ impl Profiler {
             exited_procs
         );
         info!(
-            "{} new processes this session, {} new processes since profiler startup",
+            "{} new processes detected this session, {} new processes detected since profiler startup",
             self.new_proc_per_session, self.new_proc_total
         );
         info!(
