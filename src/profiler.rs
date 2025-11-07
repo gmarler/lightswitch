@@ -858,6 +858,9 @@ impl Profiler {
                                 // TODO: Do more here with exec_mappings and object_files
                                 Some(mut proc_info) => {
                                     // Start by cleaning up all of the process mappings
+                                    // TODO: Make a note of how many mappings we had recorded for
+                                    // each PID, for comparison with how many actually exist for
+                                    // each PID
                                     for mapping in &mut proc_info.mappings.0 {
                                         let mut object_files = self.object_files.write();
                                         if mapping.mark_as_deleted(&mut object_files) {
@@ -885,6 +888,27 @@ impl Profiler {
                                             .entry(e.to_string())
                                             .and_modify(|events| *events += 1)
                                             .or_insert(1);
+                                    }
+                                    // TODO: Check how many mappings still exist for the PID, after
+                                    // all should have been obliterated, and print out the keys in
+                                    // debug format
+                                    // - How many mappings per PID (mappings_by_pid HashMap)
+                                    let mut mappings_by_pid: HashMap<u32, u32> = HashMap::new();
+                                    for key in self.native_unwinder.maps.exec_mappings.keys() {
+                                        let found_pid = exec_mappings_key::from_bytes(&key).pid;
+                                        let summarized_addr = exec_mappings_key::from_bytes(&key).data;
+                                        let prefix_len = exec_mappings_key::from_bytes(&key).prefix_len;
+                                        if found_pid == pid.try_into().unwrap() {
+                                            mappings_by_pid
+                                                .entry(pid.try_into().unwrap())
+                                                .and_modify(|count| *count += 1)
+                                                .or_insert(1);
+                                            // Print out mapping metadata
+                                            info!("PID: {:7} mapping addr: {:016X} prefix_len: {:08X}", found_pid, summarized_addr, prefix_len);
+                                        }
+                                    }
+                                    for (key, value) in mappings_by_pid {
+                                        info!("PID {} still has {} mappings!", key, value);
                                     }
                                 }
                                 // Short lived processes may never have been registered - we just
@@ -994,6 +1018,29 @@ impl Profiler {
                 .info
                 .max_entries
         );
+        // DEBUG exec_mappings usage:
+        // - Total PIDs represented (pids_with_mappings Vec)
+        let pids_with_mappings: Vec<_> = self
+            .native_unwinder
+            .maps
+            .exec_mappings
+            .keys()
+            .map(|key| exec_mappings_key::from_bytes(&key).pid)
+            .collect();
+        info!("There are {} PIDs with mappings", pids_with_mappings.len());
+        // - How many mappings per PID (mappings_by_pid HashMap)
+        let mut mappings_by_pid: HashMap<u32, u32> = HashMap::new();
+        for key in self.native_unwinder.maps.exec_mappings.keys() {
+            let pid = exec_mappings_key::from_bytes(&key).pid;
+            mappings_by_pid
+                .entry(pid)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+        }
+        for (key, value) in mappings_by_pid {
+            info!("PID {} has {} mappings", key, value);
+        }
+        // - Compare PIDs represented in exec_mappings with PIDs we're tracking, note differences
         info!("object_files count: {}", self.object_files.read().len());
         // Reset per session metrics
         self.new_proc_per_session = 0;
