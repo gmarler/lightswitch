@@ -862,7 +862,7 @@ impl Profiler {
                                     // each PID, for comparison with how many actually exist for
                                     // each PID
                                     let mapping_count = proc_info.mappings.0.iter().count();
-                                    info!("PID {} has {} known mappings", pid, mapping_count);
+                                    info!("PID {} had {} known mappings", pid, mapping_count);
                                     for mapping in &mut proc_info.mappings.0 {
                                         let mut object_files = self.object_files.write();
                                         if mapping.mark_as_deleted(&mut object_files) {
@@ -1047,6 +1047,7 @@ impl Profiler {
             .exec_mappings
             .keys()
             .map(|key| exec_mappings_key::from_bytes(&key).pid)
+            .unique()
             .collect();
         info!("There are {} PIDs with mappings", pids_with_mappings.len());
         // - How many mappings per PID (mappings_by_pid HashMap)
