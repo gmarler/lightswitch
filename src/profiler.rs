@@ -917,10 +917,19 @@ impl Profiler {
                                     }
                                     // Now, delete those mappings
                                     for key in mappings_to_delete.iter() {
-                                        // TODO: Handle Result, checking for any Errors
-                                        let _ = self.native_unwinder.maps
+                                        // Handle Result, checking for any Errors
+                                        match self.native_unwinder.maps
                                             .exec_mappings
-                                            .delete(unsafe { plain::as_bytes(&key) });
+                                            // NOTE: *this* "key" is already in plain::as_bytes(...) format
+                                            .delete(key)
+                                        {
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                error!(
+                                                    "deleting mapping for PID {} failed with {:?}",
+                                                    pid, e);
+                                            }
+                                        }
                                     }
                                 }
                                 // Short lived processes may never have been registered - we just
