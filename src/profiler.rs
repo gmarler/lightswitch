@@ -891,26 +891,36 @@ impl Profiler {
                                             .and_modify(|events| *events += 1)
                                             .or_insert(1);
                                     }
-                                    // TODO: Check how many mappings still exist for the PID, after
+                                    // Check how many mappings still exist for the PID, after
                                     // all should have been obliterated, and print out the keys in
                                     // debug format
                                     // - How many mappings per PID (mappings_by_pid HashMap)
                                     let mut mappings_by_pid: HashMap<u32, u32> = HashMap::new();
+                                    let mut mappings_to_delete: Vec<_> = vec![];
                                     for key in self.native_unwinder.maps.exec_mappings.keys() {
                                         let found_pid = exec_mappings_key::from_bytes(&key).pid;
                                         let summarized_addr = exec_mappings_key::from_bytes(&key).data;
                                         let prefix_len = exec_mappings_key::from_bytes(&key).prefix_len;
                                         if found_pid == pid.try_into().unwrap() {
+                                            mappings_to_delete.push(key);
                                             mappings_by_pid
                                                 .entry(pid.try_into().unwrap())
                                                 .and_modify(|count| *count += 1)
                                                 .or_insert(1);
                                             // Print out mapping metadata
-                                            info!("PID: {:7} mapping addr: {:016X} prefix_len: {:08X}", found_pid, summarized_addr, prefix_len);
+                                            info!("PID: {:7} mapping addr: {:016X} prefix_len: {:08X}",
+                                                  found_pid, summarized_addr, prefix_len);
                                         }
                                     }
                                     for (key, value) in mappings_by_pid {
                                         info!("PID {} still has {} mappings!", key, value);
+                                    }
+                                    // Now, delete those mappings
+                                    for key in mappings_to_delete.iter() {
+                                        // TODO: Handle Result, checking for any Errors
+                                        let _ = self.native_unwinder.maps
+                                            .exec_mappings
+                                            .delete(unsafe { plain::as_bytes(&key) });
                                     }
                                 }
                                 // Short lived processes may never have been registered - we just
