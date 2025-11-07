@@ -861,6 +861,8 @@ impl Profiler {
                                     // TODO: Make a note of how many mappings we had recorded for
                                     // each PID, for comparison with how many actually exist for
                                     // each PID
+                                    let mapping_count = proc_info.mappings.0.iter().count();
+                                    info!("PID {} has {} known mappings", pid, mapping_count);
                                     for mapping in &mut proc_info.mappings.0 {
                                         let mut object_files = self.object_files.write();
                                         if mapping.mark_as_deleted(&mut object_files) {
