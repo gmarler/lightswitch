@@ -862,7 +862,7 @@ impl Profiler {
                                     // each PID, for comparison with how many actually exist for
                                     // each PID
                                     let mapping_count = proc_info.mappings.0.iter().count();
-                                    info!("PID {} had {} known mappings", pid, mapping_count);
+                                    debug!("PID {} had {} known mappings", pid, mapping_count);
                                     for mapping in &mut proc_info.mappings.0 {
                                         let mut object_files = self.object_files.write();
                                         if mapping.mark_as_deleted(&mut object_files) {
@@ -908,12 +908,12 @@ impl Profiler {
                                                 .and_modify(|count| *count += 1)
                                                 .or_insert(1);
                                             // Print out mapping metadata
-                                            info!("PID: {:7} mapping addr: {:016X} prefix_len: {:08X}",
+                                            debug!("PID: {:7} mapping addr: {:016X} prefix_len: {:08X}",
                                                   found_pid, summarized_addr, prefix_len);
                                         }
                                     }
                                     for (key, value) in mappings_by_pid {
-                                        info!("PID {} still has {} mappings!", key, value);
+                                        warn!("Dead PID {} still has {} mappings! (will remove)", key, value);
                                     }
                                     // Now, delete those mappings
                                     for key in mappings_to_delete.iter() {
@@ -1060,7 +1060,7 @@ impl Profiler {
                 .or_insert(1);
         }
         for (key, value) in mappings_by_pid {
-            info!("PID {} has {} mappings", key, value);
+            debug!("PID {} has {} mappings", key, value);
         }
         // - Compare PIDs represented in exec_mappings with PIDs we're tracking, note differences
         info!("object_files count: {}", self.object_files.read().len());
