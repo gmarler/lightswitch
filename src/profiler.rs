@@ -897,12 +897,18 @@ impl Profiler {
                                     // - How many mappings per PID (mappings_by_pid HashMap)
                                     let mut mappings_by_pid: HashMap<u32, u32> = HashMap::new();
                                     let mut mappings_to_delete: Vec<_> = vec![];
-                                    for key in self.native_unwinder.maps.exec_mappings.keys() {
-                                        let found_pid = exec_mappings_key::from_bytes(&key).pid;
-                                        let summarized_addr = exec_mappings_key::from_bytes(&key).data;
-                                        let prefix_len = exec_mappings_key::from_bytes(&key).prefix_len;
+                                    for byte_key in self.native_unwinder.maps.exec_mappings.keys() {
+                                        let typed_key_result = exec_mappings_key::from_bytes(&byte_key);
+                                        if let Err(from_bytes_err) = typed_key_result {
+                                            warn!("Unable to extract fields from exec_mappings_key: {:?}", from_bytes_err);
+                                            continue;
+                                        }
+                                        let typed_key = typed_key_result.unwrap();
+                                        let found_pid = typed_key.pid;
+                                        let summarized_addr = typed_key.data;
+                                        let prefix_len = typed_key.prefix_len;
                                         if found_pid == pid.try_into().unwrap() {
-                                            mappings_to_delete.push(key);
+                                            mappings_to_delete.push(byte_key);
                                             mappings_by_pid
                                                 .entry(pid.try_into().unwrap())
                                                 .and_modify(|count| *count += 1)
@@ -1046,16 +1052,17 @@ impl Profiler {
             .maps
             .exec_mappings
             .keys()
-            .map(|key| exec_mappings_key::from_bytes(&key).pid)
+            // TODO: Get rid of the unwrap for the Result
+            .map(|key| exec_mappings_key::from_bytes(&key).unwrap().pid)
             .unique()
             .collect();
         info!("There are {} PIDs with mappings", pids_with_mappings.len());
         // - How many mappings per PID (mappings_by_pid HashMap)
         let mut mappings_by_pid: HashMap<u32, u32> = HashMap::new();
         for key in self.native_unwinder.maps.exec_mappings.keys() {
-            let pid = exec_mappings_key::from_bytes(&key).pid;
+            let pid = exec_mappings_key::from_bytes(&key).unwrap().pid;
             mappings_by_pid
-                .entry(pid)
+                .entry(pid.try_into().unwrap())
                 .and_modify(|count| *count += 1)
                 .or_insert(1);
         }
@@ -1394,7 +1401,7 @@ impl Profiler {
 
     fn add_bpf_process(bpf: &ProfilerSkel, pid: Pid) -> Result<(), libbpf_rs::Error> {
         let key = exec_mappings_key::new(
-            pid as u32, 0x0, 32, // pid bits
+            pid, 0x0, 32, // pid bits
         );
         Self::add_bpf_mapping(
             bpf,
@@ -1417,11 +1424,8 @@ impl Profiler {
     ) -> Result<(), libbpf_rs::Error> {
         for mapping in mappings {
             for address_range in summarize_address_range(mapping.begin, mapping.end - 1) {
-                let key = exec_mappings_key::new(
-                    pid as u32,
-                    address_range.addr,
-                    32 + address_range.prefix_len,
-                );
+                let key =
+                    exec_mappings_key::new(pid, address_range.addr, 32 + address_range.prefix_len);
 
                 Self::add_bpf_mapping(bpf, &key, mapping)?
             }
@@ -1437,11 +1441,8 @@ impl Profiler {
         partial_write: bool,
     ) {
         for address_range in summarize_address_range(mapping_begin, mapping_end - 1) {
-            let key = exec_mappings_key::new(
-                pid as u32,
-                address_range.addr,
-                32 + address_range.prefix_len,
-            );
+            let key =
+                exec_mappings_key::new(pid, address_range.addr, 32 + address_range.prefix_len);
 
             // TODO keep track of errors
             let res = bpf
@@ -1461,7 +1462,7 @@ impl Profiler {
 
     fn delete_bpf_process(bpf: &ProfilerSkel, pid: Pid) -> Result<(), libbpf_rs::Error> {
         let key = exec_mappings_key::new(
-            pid as u32, 0x0, 32, // pid bits
+            pid, 0x0, 32, // pid bits
         );
         bpf.maps
             .exec_mappings
@@ -1805,7 +1806,7 @@ impl Profiler {
     }
 
     /// Evict executables if the 'outer' map is full or if the max memory is exceeded. Note that
-    /// the memory accounting is approximate. If returns whether the unwind information can
+    /// the memory accounting is approximate. It returns whether the unwind information can
     /// be added to added BPF maps.
     ///
     ///  * `unwind_info_len`: The number of unwind information rows that will be added.
@@ -1837,15 +1838,18 @@ impl Profiler {
             return false;
         }
 
-        debug!(
-            "unwind information size to free {} MB (used {} MB / {} MB)",
-            to_free_mb, total_memory_used_mb, max_memory_mb
-        );
+        // We should print info log if we're going to need to evict for now
+        if to_free_mb > 0 {
+            info!(
+                "unwind information size to free {} MB (used {} MB / {} MB)",
+                to_free_mb, total_memory_used_mb, max_memory_mb
+            );
+        }
 
         // Figure out what are the unwind info we should evict to stay below the memory limit.
         let mut could_be_freed_mb = 0;
-        for (executable_id, _) in self.last_used_executables() {
-            let unwind_size_mb = Self::unwind_info_size_mb(unwind_info_len);
+        for (executable_id, executable_info) in self.last_used_executables() {
+            let unwind_size_mb = Self::unwind_info_size_mb(executable_info.unwind_info_len);
             if could_be_freed_mb >= to_free_mb {
                 break;
             }
@@ -1977,10 +1981,10 @@ impl Profiler {
 
         let mut to_evict = None;
         if should_evict {
-            // Make sure we never pick PID 0 (the kernel) as a victim
+            // Make sure we never pick KERNEL_PID as an eviction victim
             let victim = running_procs
                 .sorted_by(|a, b| a.1.last_used.cmp(&b.1.last_used))
-                .find(|e| *e.0 != 0);
+                .find(|e| *e.0 != KERNEL_PID);
 
             if let Some((pid, _)) = victim {
                 to_evict = Some(*pid);
