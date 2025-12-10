@@ -1071,6 +1071,13 @@ impl Profiler {
         }
         // - Compare PIDs represented in exec_mappings with PIDs we're tracking, note differences
         info!("object_files count: {}", self.object_files.read().len());
+        // Unwind Info Usage Metrics
+        let used_unwind_info_size_mb = self.unwind_info_memory_usage();
+        let max_unwind_info_size_mb = self.max_native_unwind_info_size_mb;
+        info!(
+            "unwind information usage: {} MB / {} MB",
+            used_unwind_info_size_mb, max_unwind_info_size_mb
+        );
         // Reset per session metrics
         self.new_proc_per_session = 0;
         self.exit_proc_per_session = 0;
