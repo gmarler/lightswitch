@@ -4,12 +4,15 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::anyhow;
 use lru::LruCache;
 use parking_lot::Mutex;
 use reqwest::StatusCode;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 use lightswitch_object::BuildId;
 use lightswitch_object::ExecutableId;
@@ -128,6 +131,51 @@ fn classify(status: StatusCode) -> BackendQuery {
 /// TODO: Make configurable via the cli
 const DEBUG_INFO_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
+/// How long to wait before asking again, indexed by the number of attempts
+/// that have already failed.
+///
+/// The last entry repeats for every failure after it. A backend down for 15
+/// minutes is a backend the whole fleet is already looking for.
+const BACKOFF_SECS: [u32; 6] = [30, 60, 120, 240, 480, 900];
+/// Width of the jitter, in seconds. 0-15 is enough to break up a fleet that
+/// would otherwise retry in lockstep.
+const BACKOFF_JITTER_MASK: u32 = 0xF;
+
+/// What we know about a build ID.
+///
+/// Deliberately `Copy` and 8 bytes wide. The deadline is a `u32` count of
+/// seconds since [`DebugInfoBackendRemote::started_at`] rather than an
+/// `Instant`, which is 16 bytes on Linux and would double the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugInfoStatus {
+    /// The backend has it. Never ask again.
+    Known,
+    /// The last attempt failed. Do not ask again before `retry_at_secs`.
+    Backoff { retry_at_secs: u32, attempts: u8 },
+}
+
+/// How long to wait after `attempts` consecutive failures, plus `jitter_secs`.
+///
+/// Taken out of the cache so it can be checked without one.
+fn next_backoff(attempts: u8, jitter_secs: u32) -> u32 {
+    let step = usize::from(attempts).min(BACKOFF_SECS.len() - 1);
+    BACKOFF_SECS[step] + jitter_secs
+}
+
+/// A per-process seed for the jitter.
+///
+/// XOR'ing the pid with the current nanoseconds gives every agent a different
+/// seed, so hosts across the fleet do not all retry at the same moment. A seed
+/// from the build ID alone would be the same everywhere and wouldn't give us an
+/// even spread.
+fn jitter_seed() -> u32 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.subsec_nanos())
+        .unwrap_or(0);
+    std::process::id() ^ nanos
+}
+
 #[derive(Debug)]
 pub struct DebugInfoBackendRemote {
     pub token: Option<String>,
@@ -142,13 +190,18 @@ pub struct DebugInfoBackendRemote {
     /// separately allocated `Vec<u8>`. It also helps that it's what the
     /// profiler already uses to track object files.
     ///
-    /// Only positive answers are recorded (until the next PR). A query the
-    /// backend could not answer, or an upload that failed does nothing, so
-    /// it is retried on the next process that maps the executable.
+    /// A failed attempt is recorded too, as a deadline before which we will
+    /// not ask again. Without that, a backend that is down turns every mapped
+    /// executable back into a request, which is the load we are trying to
+    /// avoid at exactly the moment it hurts most.
     ///
     /// Built with `sparse` rather than `new`: so that we have as few entries as
     /// possible.
-    known: Mutex<LruCache<ExecutableId, ()>>,
+    known: Mutex<LruCache<ExecutableId, DebugInfoStatus>>,
+    /// Reference point for the `u32` deadlines in [`DebugInfoStatus`].
+    started_at: Instant,
+    /// Per-process seed for the retry jitter. See [`jitter_seed`].
+    jitter_seed: u32,
 }
 
 impl DebugInfoBackendRemote {
@@ -170,20 +223,79 @@ impl DebugInfoBackendRemote {
                 .user_agent(NAME_AND_VERSION)
                 .build()?,
             known: Mutex::new(LruCache::sparse(DEBUG_INFO_CACHE_ENTRIES)),
+            started_at: Instant::now(),
+            jitter_seed: jitter_seed(),
         })
     }
 
-    /// Has the backend already told us it holds this build ID?
+    /// Seconds since this backend was built.
+    fn now_secs(&self) -> u32 {
+        self.started_at.elapsed().as_secs() as u32
+    }
+
+    /// The jitter for one build ID: stable for a given id on a given agent,
+    /// different on the next agent. No RNG and no extra state.
+    fn jitter_for(&self, executable_id: ExecutableId) -> u32 {
+        (executable_id.0 as u32 ^ self.jitter_seed) & BACKOFF_JITTER_MASK
+    }
+
+    /// What we last recorded about this build ID.
     ///
     /// The lock is held for the lookup alone, never across the request that may
     /// follow. A hit promotes the entry, so executables that keep being used
     /// are the last to be evicted.
-    fn is_known(&self, executable_id: ExecutableId) -> bool {
-        self.known.lock().get(&executable_id).is_some()
+    fn status(&self, executable_id: ExecutableId) -> Option<DebugInfoStatus> {
+        self.known.lock().get(&executable_id).copied()
+    }
+
+    /// Why we should not ask the backend about this build ID.
+    ///
+    /// Returns a string rather than a bool so the debug log can say which of
+    /// the two reasons applied.
+    fn suppression_reason(&self, executable_id: ExecutableId) -> Option<&'static str> {
+        match self.status(executable_id)? {
+            DebugInfoStatus::Known => Some("the backend already has it"),
+            DebugInfoStatus::Backoff { retry_at_secs, .. } => {
+                (self.now_secs() < retry_at_secs).then_some("the last attempt failed recently")
+            }
+        }
     }
 
     fn mark_known(&self, executable_id: ExecutableId) {
-        self.known.lock().put(executable_id, ());
+        self.known.lock().put(executable_id, DebugInfoStatus::Known);
+    }
+
+    /// Record a failed attempt, and return how many had already failed.
+    ///
+    /// The deadline and the jitter are computed before the lock is taken.
+    fn mark_failed(&self, executable_id: ExecutableId) -> u8 {
+        let now_secs = self.now_secs();
+        let jitter_secs = self.jitter_for(executable_id);
+
+        let mut known = self.known.lock();
+        let attempts = match known.get(&executable_id) {
+            Some(DebugInfoStatus::Backoff { attempts, .. }) => *attempts,
+            _ => 0,
+        };
+        known.put(
+            executable_id,
+            DebugInfoStatus::Backoff {
+                retry_at_secs: now_secs + next_backoff(attempts, jitter_secs),
+                attempts: attempts.saturating_add(1),
+            },
+        );
+        attempts
+    }
+
+    /// Note a failed attempt.
+    fn record_failure(&self, executable_id: ExecutableId, build_id: &BuildId, what: &str) {
+        let attempts = self.mark_failed(executable_id);
+        debug!(
+            "debuginfo backend {} for {}, {} consecutive failures",
+            what,
+            build_id,
+            attempts + 1
+        );
     }
 }
 
@@ -199,8 +311,8 @@ impl DebugInfoManager for DebugInfoBackendRemote {
     ) -> anyhow::Result<()> {
         let executable_id = build_id.id()?;
 
-        if self.is_known(executable_id) {
-            debug!("debuginfo for {} is already on the backend", build_id);
+        if let Some(reason) = self.suppression_reason(executable_id) {
+            debug!("not asking about {}: {}", build_id, reason);
             return Ok(());
         }
 
@@ -210,24 +322,26 @@ impl DebugInfoManager for DebugInfoBackendRemote {
                 Ok(())
             }
             BackendQuery::Unavailable => {
-                // Deliberately not recorded: an unanswered query is not an
-                // answer of any kind, so the next process that maps this
-                // executable asks the backend again.
-                warn!(
-                    "debuginfo backend did not answer for {}, skipping upload",
-                    build_id
-                );
+                // Not an answer, so we record a deadline rather than a
+                // result. We ask again later, not once per process that
+                // maps this executable.
+                self.record_failure(executable_id, build_id, "did not answer");
                 Ok(())
             }
             // TODO: do this in another thread.
-            BackendQuery::Absent => {
-                self.upload_to_backend(name, build_id, debug_info)?;
-                // Only after the upload succeeded. A failed upload leaves the
-                // backend without the debug information, so recording it as
-                // present would prevent every later attempt.
-                self.mark_known(executable_id);
-                Ok(())
-            }
+            BackendQuery::Absent => match self.upload_to_backend(name, build_id, debug_info) {
+                // Only mark it known when the upload worked. Otherwise the
+                // backend still lacks the debug information, and we would
+                // never try again.
+                Ok(()) => {
+                    self.mark_known(executable_id);
+                    Ok(())
+                }
+                Err(e) => {
+                    self.record_failure(executable_id, build_id, "rejected the upload");
+                    Err(e)
+                }
+            },
         }
     }
 
@@ -330,6 +444,24 @@ mod tests {
         assert_ne!(classify(status), BackendQuery::Absent);
     }
 
+    #[rstest]
+    #[case(0, 0, 30)]
+    #[case(1, 0, 60)]
+    // Every failure past the end of the table waits the same, longest, time.
+    #[case(5, 0, 900)]
+    #[case(u8::MAX, 0, 900)]
+    // The jitter is added after the cap, so it still spreads out a fleet that
+    // has all reached the longest wait.
+    #[case(0, 7, 37)]
+    #[case(u8::MAX, 15, 915)]
+    fn the_backoff_doubles_then_stops(
+        #[case] attempts: u8,
+        #[case] jitter_secs: u32,
+        #[case] expected: u32,
+    ) {
+        assert_eq!(next_backoff(attempts, jitter_secs), expected);
+    }
+
     mod cache {
         use super::*;
 
@@ -404,10 +536,11 @@ mod tests {
         }
 
         #[test]
-        fn an_unanswered_query_is_not_cached() {
-            // The backend never said whether it has this build ID, so nothing
-            // has been learned and every call must ask again. Caching here
-            // would make a transient 503 look like a permanent answer.
+        fn an_unanswered_query_waits_before_asking_again() {
+            // A 503 is not an answer, so it is never recorded as one. It does
+            // start a backoff: the calls that follow within the wait are
+            // skipped, which is the difference between asking again later and
+            // asking again immediately.
             let (url, seen) = canned_server("503 Service Unavailable");
             let backend = backend(url);
             let build_id = build_id(0xcd);
@@ -419,7 +552,7 @@ mod tests {
             }
 
             let seen = seen.lock();
-            assert_eq!(seen.len(), 3, "expected three requests, saw {seen:?}");
+            assert_eq!(seen.len(), 1, "expected one request, saw {seen:?}");
             assert!(
                 seen.iter().all(|line| line.starts_with("GET ")),
                 "a query the backend could not answer must never be followed by \
@@ -428,10 +561,65 @@ mod tests {
         }
 
         #[test]
-        fn a_failed_upload_is_not_cached() {
+        fn an_expired_backoff_allows_one_more_attempt() {
+            // The backoff has to end, or an unreachable backend would never be
+            // asked again for the life of the agent.
+            let (url, seen) = canned_server("503 Service Unavailable");
+            let backend = backend(url);
+            let build_id = build_id(0x11);
+            let executable_id = build_id.id().expect("executable id");
+
+            backend
+                .add_if_not_present("test", &build_id, Path::new("/nonexistent"))
+                .expect("unavailable is not an error");
+            assert_eq!(seen.lock().len(), 1);
+
+            // Put the deadline in the past so the test need not wait 30
+            // seconds for it: zero is before anything `now_secs` can return.
+            //
+            // Leave the attempt count at 1. The next failure should then wait
+            // 60 seconds, the second step. If it waits 30 the schedule
+            // restarted, which is the bug this test looks for.
+            backend.known.lock().put(
+                executable_id,
+                DebugInfoStatus::Backoff {
+                    retry_at_secs: 0,
+                    attempts: 1,
+                },
+            );
+
+            // The deadline has passed, so this call must reach the backend.
+            backend
+                .add_if_not_present("test", &build_id, Path::new("/nonexistent"))
+                .expect("unavailable is not an error");
+            assert_eq!(
+                seen.lock().len(),
+                2,
+                "an expired backoff must allow another attempt"
+            );
+
+            // It failed again, so the schedule must advance a step, not
+            // start over.
+            match backend.status(executable_id) {
+                Some(DebugInfoStatus::Backoff {
+                    retry_at_secs,
+                    attempts,
+                }) => {
+                    assert_eq!(attempts, 2, "both failures must be counted");
+                    assert!(
+                        retry_at_secs >= next_backoff(1, 0),
+                        "the wait must have advanced to the second step, got {retry_at_secs}"
+                    );
+                }
+                other => panic!("expected a backoff, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_failed_upload_is_recorded_as_a_failure() {
             // 404 routes to the upload, which cannot succeed because the path
             // does not exist. The backend still lacks this build ID, so it must
-            // not be remembered as if it had it.
+            // be recorded as a failure to retry, never as present.
             let (url, _seen) = canned_server("404 Not Found");
             let backend = backend(url);
             let build_id = build_id(0xef);
@@ -441,11 +629,15 @@ mod tests {
                 backend
                     .add_if_not_present("test", &build_id, Path::new("/nonexistent"))
                     .is_err(),
-                "opening a missing debuginfo file should fail"
+                "the upload must fail, so there is a failure to record"
             );
             assert!(
-                !backend.is_known(executable_id),
-                "a failed upload must not be recorded as present"
+                matches!(
+                    backend.status(executable_id),
+                    Some(DebugInfoStatus::Backoff { attempts: 1, .. })
+                ),
+                "a failed upload must be recorded as a first failure, got {:?}",
+                backend.status(executable_id)
             );
         }
 
@@ -458,15 +650,22 @@ mod tests {
             for i in 0..capacity {
                 backend.mark_known(ExecutableId(i));
             }
-            assert!(backend.is_known(first), "should still fit at capacity");
+            assert!(
+                backend.status(first).is_some(),
+                "nothing must be evicted at exactly capacity"
+            );
 
             // One past capacity evicts the least recently used. The lookup
-            // above promoted the first entry, so the second is the one to go.
+            // above promoted the first entry, so the second is the one that
+            // will be evicted
             backend.mark_known(ExecutableId(capacity));
-            assert!(backend.is_known(first), "promoted by the last lookup");
             assert!(
-                !backend.is_known(ExecutableId(1)),
-                "evicted, so it has to be asked about again"
+                backend.status(first).is_some(),
+                "the earlier lookup promoted this, so it must survive"
+            );
+            assert!(
+                backend.status(ExecutableId(1)).is_none(),
+                "the least recently used entry must be evicted"
             );
         }
     }
