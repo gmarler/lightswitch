@@ -3,6 +3,7 @@ use clap::Subcommand;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use lightswitch::debug_info::DEBUG_INFO_CACHE_ENTRIES;
 use lightswitch::profiler::ProfilerConfig;
 
 use crate::validators::parse_duration;
@@ -165,6 +166,12 @@ pub(crate) struct CliArgs {
     pub(crate) symbolizer: Symbolizer,
     #[arg(long, default_value_t, value_enum)]
     pub(crate) debug_info_backend: DebugInfoBackend,
+    #[arg(
+        long,
+        default_value_t = DEBUG_INFO_CACHE_ENTRIES.get(),
+        help = "how many build IDs the remote debuginfo backend remembers. 0 disables the cache"
+    )]
+    pub(crate) debug_info_cache_entries: usize,
     #[arg(
         long,
         default_value_t = ProfilerConfig::default().max_native_unwind_info_size_mb,

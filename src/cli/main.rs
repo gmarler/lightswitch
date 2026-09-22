@@ -281,6 +281,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             server_url.clone(),
             Duration::from_millis(500),
             Duration::from_secs(15),
+            args.debug_info_cache_entries,
         )?),
     };
 
@@ -695,6 +696,11 @@ mod tests {
               --debug-info-backend <DEBUG_INFO_BACKEND>
                   [default: none]
                   [possible values: none, copy, remote]
+
+              --debug-info-cache-entries <DEBUG_INFO_CACHE_ENTRIES>
+                  how many build IDs the remote debuginfo backend remembers. 0 disables the cache
+                  
+                  [default: 1024]
 
               --max-native-unwind-info-size-mb <MAX_NATIVE_UNWIND_INFO_SIZE_MB>
                   approximate max size in megabytes used for the BPF maps that hold unwind information
