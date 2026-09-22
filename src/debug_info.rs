@@ -124,12 +124,12 @@ fn classify(status: StatusCode) -> BackendQuery {
     }
 }
 
-/// The max number of build IDs to remember.
+/// The default max number of build IDs to remember.
 ///
 /// Using `NonZeroUsize` because that is what `LruCache::new` and
-/// `LruCache::sparse` take.
-/// TODO: Make configurable via the cli
-const DEBUG_INFO_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
+/// `LruCache::sparse` take. The CLI takes a plain `usize` so that zero can
+/// mean "no cache"; see [`DebugInfoBackendRemote::new`].
+pub const DEBUG_INFO_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 /// How long to wait before asking again, indexed by the number of attempts
 /// that have already failed.
@@ -197,7 +197,10 @@ pub struct DebugInfoBackendRemote {
     ///
     /// Built with `sparse` rather than `new`: so that we have as few entries as
     /// possible.
-    known: Mutex<LruCache<ExecutableId, DebugInfoStatus>>,
+    ///
+    /// `None` when the cache is switched off, which restores the behaviour of
+    /// asking the backend about every mapped executable.
+    known: Option<Mutex<LruCache<ExecutableId, DebugInfoStatus>>>,
     /// Reference point for the `u32` deadlines in [`DebugInfoStatus`].
     started_at: Instant,
     /// Per-process seed for the retry jitter. See [`jitter_seed`].
@@ -205,11 +208,13 @@ pub struct DebugInfoBackendRemote {
 }
 
 impl DebugInfoBackendRemote {
+    /// `cache_entries` of zero switches the cache off entirely.
     pub fn new(
         token: Option<String>,
         server_url: String,
         query_timeout: Duration,
         upload_timeout: Duration,
+        cache_entries: usize,
     ) -> anyhow::Result<Self> {
         Ok(DebugInfoBackendRemote {
             token,
@@ -222,7 +227,10 @@ impl DebugInfoBackendRemote {
                 .timeout(upload_timeout)
                 .user_agent(NAME_AND_VERSION)
                 .build()?,
-            known: Mutex::new(LruCache::sparse(DEBUG_INFO_CACHE_ENTRIES)),
+            // `NonZeroUsize::new(0)` is `None`, so a zero capacity leaves the
+            // cache switched off without a separate check for it.
+            known: NonZeroUsize::new(cache_entries)
+                .map(|entries| Mutex::new(LruCache::sparse(entries))),
             started_at: Instant::now(),
             jitter_seed: jitter_seed(),
         })
@@ -244,8 +252,9 @@ impl DebugInfoBackendRemote {
     /// The lock is held for the lookup alone, never across the request that may
     /// follow. A hit promotes the entry, so executables that keep being used
     /// are the last to be evicted.
+    /// `None` when the cache is switched off, so nothing is ever suppressed.
     fn status(&self, executable_id: ExecutableId) -> Option<DebugInfoStatus> {
-        self.known.lock().get(&executable_id).copied()
+        self.known.as_ref()?.lock().get(&executable_id).copied()
     }
 
     /// Why we should not ask the backend about this build ID.
@@ -262,17 +271,22 @@ impl DebugInfoBackendRemote {
     }
 
     fn mark_known(&self, executable_id: ExecutableId) {
-        self.known.lock().put(executable_id, DebugInfoStatus::Known);
+        if let Some(known) = &self.known {
+            known.lock().put(executable_id, DebugInfoStatus::Known);
+        }
     }
 
     /// Record a failed attempt, and return how many had already failed.
     ///
     /// The deadline and the jitter are computed before the lock is taken.
     fn mark_failed(&self, executable_id: ExecutableId) -> u8 {
+        let Some(known) = &self.known else {
+            return 0;
+        };
         let now_secs = self.now_secs();
         let jitter_secs = self.jitter_for(executable_id);
 
-        let mut known = self.known.lock();
+        let mut known = known.lock();
         let attempts = match known.get(&executable_id) {
             Some(DebugInfoStatus::Backoff { attempts, .. }) => *attempts,
             _ => 0,
@@ -505,11 +519,19 @@ mod tests {
         }
 
         fn backend(server_url: String) -> DebugInfoBackendRemote {
+            backend_with_entries(server_url, DEBUG_INFO_CACHE_ENTRIES.get())
+        }
+
+        fn backend_with_entries(
+            server_url: String,
+            cache_entries: usize,
+        ) -> DebugInfoBackendRemote {
             DebugInfoBackendRemote::new(
                 None,
                 server_url,
                 Duration::from_secs(5),
                 Duration::from_secs(5),
+                cache_entries,
             )
             .expect("build backend")
         }
@@ -533,6 +555,28 @@ mod tests {
             let seen = seen.lock();
             assert_eq!(seen.len(), 1, "expected one request, saw {seen:?}");
             assert!(seen[0].starts_with("GET "), "saw {:?}", seen[0]);
+        }
+
+        #[test]
+        fn a_disabled_cache_asks_about_every_process() {
+            // What `--debug-info-cache-entries 0` buys: the behaviour from
+            // before any of this existed, for anyone who wants it back.
+            let (url, seen) = canned_server("200 OK");
+            let backend = backend_with_entries(url, 0);
+            let build_id = build_id(0x5a);
+
+            for _ in 0..3 {
+                backend
+                    .add_if_not_present("test", &build_id, Path::new("/nonexistent"))
+                    .expect("should not error");
+            }
+
+            let seen = seen.lock();
+            assert_eq!(
+                seen.len(),
+                3,
+                "a disabled cache must remember nothing, saw {seen:?}"
+            );
         }
 
         #[test]
@@ -580,7 +624,8 @@ mod tests {
             // Leave the attempt count at 1. The next failure should then wait
             // 60 seconds, the second step. If it waits 30 the schedule
             // restarted, which is the bug this test looks for.
-            backend.known.lock().put(
+            let known = backend.known.as_ref().expect("cache is enabled");
+            known.lock().put(
                 executable_id,
                 DebugInfoStatus::Backoff {
                     retry_at_secs: 0,
